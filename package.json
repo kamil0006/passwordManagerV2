@@ -1,0 +1,23 @@
+{
+	"name": "passwordmanager",
+	"version": "1.0.0",
+	"description": "",
+	"main": "main.js",
+	"scripts": {
+		"start": "concurrently \"npm run dev --prefix frontend\" \"wait-on http://localhost:5173 && electron . --no-sandbox\""
+	},
+	"keywords": [],
+	"author": "",
+	"license": "ISC",
+	"type": "commonjs",
+	"devDependencies": {
+		"concurrently": "^9.2.0",
+		"electron": "^37.3.1",
+		"electron-rebuild": "^3.2.9",
+		"wait-on": "^8.0.4"
+	},
+	"dependencies": {
+		"better-sqlite3": "^12.2.0",
+		"crypto-js": "^4.2.0"
+	}
+}

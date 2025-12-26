@@ -1,0 +1,122 @@
+.theme-toggle {
+	position: absolute;
+	top: 10px;
+	right: 20px;
+	width: 56px;
+	height: 56px;
+	border-radius: 50%;
+	background: var(--bg-secondary);
+	border: 2px solid var(--border-color);
+	color: var(--text-primary);
+	cursor: pointer;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	transition: all 0.3s ease;
+	box-shadow: 0 4px 12px var(--shadow-color);
+	z-index: 1000;
+	touch-action: manipulation;
+	backdrop-filter: blur(10px);
+}
+
+.theme-toggle:hover {
+	transform: scale(1.1);
+	box-shadow: 0 6px 20px var(--shadow-color);
+	border-color: var(--accent-color);
+}
+
+.theme-toggle:active {
+	transform: scale(0.95);
+}
+
+.theme-icon {
+	transition: all 0.3s ease;
+	width: 28px;
+	height: 28px;
+}
+
+.theme-toggle:hover .theme-icon {
+	transform: rotate(15deg);
+}
+
+/* Theme-specific icon colors */
+[data-theme='dark'] .theme-toggle .theme-icon {
+	color: #fbbf24; /* Amber color for sun icon in dark mode */
+}
+
+[data-theme='light'] .theme-toggle .theme-icon {
+	color: #1f2937; /* Dark color for moon icon in light mode */
+}
+
+/* Responsive design */
+@media (max-width: 768px) {
+	.theme-toggle {
+		top: 10px;
+		right: 15px;
+		width: 52px;
+		height: 52px;
+		border-width: 3px;
+		box-shadow: 0 6px 16px var(--shadow-color), 0 0 0 2px rgba(255, 255, 255, 0.1);
+	}
+
+	.theme-icon {
+		width: 32px;
+		height: 32px;
+	}
+}
+
+@media (max-width: 600px) {
+	.theme-toggle {
+		top: 10px;
+		right: 15px;
+		width: 52px;
+		height: 52px;
+		border-width: 3px;
+		box-shadow: 0 6px 16px var(--shadow-color), 0 0 0 2px rgba(255, 255, 255, 0.1);
+	}
+
+	.theme-icon {
+		width: 42px;
+		height: 42px;
+	}
+}
+
+@media (max-width: 480px) {
+	.theme-toggle {
+		top: 10px;
+		right: 10px;
+		width: 44px;
+		height: 44px;
+		border-width: 3px;
+		box-shadow: 0 6px 16px var(--shadow-color), 0 0 0 2px rgba(255, 255, 255, 0.1);
+	}
+
+	.theme-icon {
+		width: 40px;
+		height: 40px;
+	}
+}
+
+@media (max-width: 320px) {
+	.theme-toggle {
+		top: 10px;
+		right: 8px;
+		width: 44px;
+		height: 44px;
+		border-width: 3px;
+		box-shadow: 0 6px 16px var(--shadow-color), 0 0 0 2px rgba(255, 255, 255, 0.1);
+	}
+
+	.theme-icon {
+		width: 44px;
+		height: 44px;
+	}
+}
+
+/* Touch device optimizations */
+@media (hover: none) and (pointer: coarse) {
+	.theme-toggle {
+		min-width: 44px;
+		min-height: 44px;
+	}
+}

@@ -1,0 +1,227 @@
+# ============================================
+# CRITICAL SECURITY - NEVER COMMIT THESE!
+# ============================================
+
+# Database files (contains encrypted passwords - NEVER commit!)
+*.db
+*.sqlite
+*.sqlite3
+*.db-wal
+*.db-shm
+*.db-journal
+db/*.db
+db/*.sqlite
+db/*.sqlite3
+
+# Database in user data directory (Electron app.getPath('userData'))
+# Windows: %APPDATA%/password-manager/vault.db
+# macOS: ~/Library/Application Support/password-manager/vault.db
+# Linux: ~/.config/password-manager/vault.db
+# Also: ~/.password-manager/vault.db (fallback location)
+**/vault.db
+**/*.db
+
+# IMPORTANT: The db/ folder contains source code (vault.js, vault-worker.js) 
+# which SHOULD be committed. Only database files (*.db) are ignored above.
+# 
+# If you want to hide the ENTIRE db/ folder (including source code), 
+# uncomment the line below. WARNING: This will hide vault.js and vault-worker.js too!
+# db/
+
+# Project documentation (internal use only)
+PROJECT_SUMMARY.md
+SECURITY_FEATURES.md
+
+# Environment variables and secrets
+.env
+.env.local
+.env.*.local
+*.env
+secrets/
+*.key
+*.pem
+*.cert
+
+# ============================================
+# Dependencies
+# ============================================
+node_modules/
+frontend/node_modules/
+**/node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+.pnpm-debug.log*
+
+# Package manager lock files (keep package-lock.json for consistency)
+# Note: package-lock.json should usually be committed for consistency
+# Uncomment if you don't want to track lock files:
+# package-lock.json
+# yarn.lock
+# pnpm-lock.yaml
+
+# ============================================
+# Build outputs and dist folders
+# ============================================
+dist/
+build/
+out/
+frontend/dist/
+frontend/build/
+frontend/out/
+*.tsbuildinfo
+.next/
+.nuxt/
+.cache/
+
+# ============================================
+# Electron specific
+# ============================================
+out/
+app/
+release/
+*.app
+*.dmg
+*.exe
+*.deb
+*.rpm
+*.snap
+*.AppImage
+electron-builder-output/
+
+# ============================================
+# IDE and Editor files
+# ============================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+*.sublime-project
+*.sublime-workspace
+*.code-workspace
+
+# ============================================
+# OS specific files
+# ============================================
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# Linux
+*~
+.directory
+.Trash-*
+
+# ============================================
+# Logs and temporary files
+# ============================================
+*.log
+logs/
+*.tmp
+*.temp
+*.bak
+*.backup
+*.old
+*.orig
+*.save
+*.swp
+*.swo
+
+# ============================================
+# Testing and coverage
+# ============================================
+coverage/
+.nyc_output/
+*.lcov
+.jest/
+test-results/
+playwright-report/
+playwright/.cache/
+
+# ============================================
+# TypeScript
+# ============================================
+*.tsbuildinfo
+.tsbuildinfo
+
+# ============================================
+# Miscellaneous
+# ============================================
+# Local configuration files
+.local
+local.json
+config.local.json
+
+# Debug files
+.vscode-test/
+*.pid
+*.seed
+*.pid.lock
+
+# Optional npm cache directory
+.npm
+
+# Optional eslint cache
+.eslintcache
+
+# Optional stylelint cache
+.stylelintcache
+
+# Microbundle cache
+.rpt2_cache/
+.rts2_cache_cjs/
+.rts2_cache_es/
+.rts2_cache_umd/
+
+# Optional REPL history
+.node_repl_history
+
+# Output of 'npm pack'
+*.tgz
+
+# Yarn Integrity file
+.yarn-integrity
+
+# parcel-bundler cache
+.parcel-cache
+
+# Stores VSCode versions used for testing VSCode extensions
+.vscode-test
+
+# Temporary folders
+tmp/
+temp/
+
+# ============================================
+# Security and sensitive data
+# ============================================
+# Backup files
+*.backup
+*.bak
+backup/
+backups/
+
+# Encrypted files (if any)
+*.enc
+*.gpg
+
+# Session files
+*.session
+*.sess
