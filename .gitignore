@@ -9,24 +9,6 @@
 *.db-wal
 *.db-shm
 *.db-journal
-db/*.db
-db/*.sqlite
-db/*.sqlite3
-
-# Database in user data directory (Electron app.getPath('userData'))
-# Windows: %APPDATA%/password-manager/vault.db
-# macOS: ~/Library/Application Support/password-manager/vault.db
-# Linux: ~/.config/password-manager/vault.db
-# Also: ~/.password-manager/vault.db (fallback location)
-**/vault.db
-**/*.db
-
-# IMPORTANT: The db/ folder contains source code (vault.js, vault-worker.js) 
-# which SHOULD be committed. Only database files (*.db) are ignored above.
-# 
-# If you want to hide the ENTIRE db/ folder (including source code), 
-# uncomment the line below. WARNING: This will hide vault.js and vault-worker.js too!
-# db/
 
 # Project documentation (internal use only)
 PROJECT_SUMMARY.md
@@ -46,7 +28,6 @@ secrets/
 # Dependencies
 # ============================================
 node_modules/
-frontend/node_modules/
 **/node_modules/
 npm-debug.log*
 yarn-debug.log*
@@ -55,22 +36,12 @@ pnpm-debug.log*
 lerna-debug.log*
 .pnpm-debug.log*
 
-# Package manager lock files (keep package-lock.json for consistency)
-# Note: package-lock.json should usually be committed for consistency
-# Uncomment if you don't want to track lock files:
-# package-lock.json
-# yarn.lock
-# pnpm-lock.yaml
-
 # ============================================
-# Build outputs and dist folders
+# Build outputs
 # ============================================
 dist/
 build/
 out/
-frontend/dist/
-frontend/build/
-frontend/out/
 *.tsbuildinfo
 .next/
 .nuxt/
@@ -79,7 +50,6 @@ frontend/out/
 # ============================================
 # Electron specific
 # ============================================
-out/
 app/
 release/
 *.app
@@ -125,7 +95,6 @@ $RECYCLE.BIN/
 *.lnk
 
 # Linux
-*~
 .directory
 .Trash-*
 
@@ -141,8 +110,6 @@ logs/
 *.old
 *.orig
 *.save
-*.swp
-*.swo
 
 # ============================================
 # Testing and coverage
@@ -156,72 +123,29 @@ playwright-report/
 playwright/.cache/
 
 # ============================================
-# TypeScript
-# ============================================
-*.tsbuildinfo
-.tsbuildinfo
-
-# ============================================
 # Miscellaneous
 # ============================================
-# Local configuration files
 .local
 local.json
 config.local.json
-
-# Debug files
 .vscode-test/
 *.pid
 *.seed
 *.pid.lock
-
-# Optional npm cache directory
 .npm
-
-# Optional eslint cache
 .eslintcache
-
-# Optional stylelint cache
 .stylelintcache
-
-# Microbundle cache
 .rpt2_cache/
 .rts2_cache_cjs/
 .rts2_cache_es/
 .rts2_cache_umd/
-
-# Optional REPL history
 .node_repl_history
-
-# Output of 'npm pack'
 *.tgz
-
-# Yarn Integrity file
 .yarn-integrity
-
-# parcel-bundler cache
 .parcel-cache
-
-# Stores VSCode versions used for testing VSCode extensions
-.vscode-test
-
-# Temporary folders
 tmp/
 temp/
-
-# ============================================
-# Security and sensitive data
-# ============================================
-# Backup files
-*.backup
-*.bak
-backup/
-backups/
-
-# Encrypted files (if any)
 *.enc
 *.gpg
-
-# Session files
 *.session
 *.sess
