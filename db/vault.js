@@ -1,8 +1,110 @@
 const Database = require('better-sqlite3');
-const CryptoJS = require('crypto-js');
+const crypto = require('crypto'); // Use Node crypto for all encryption
+const CryptoJS = require('crypto-js'); // Keep for legacy data migration only
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
+
+// Worker reference for cryptographic operations
+// Set by main.js or use local crypto as fallback
+let cryptoWorkerRef = null;
+
+// Pending requests map for worker communication (prevents listener leaks)
+const pendingRequests = new Map();
+
+// Single worker message handler (prevents multiple listeners)
+let workerMessageHandler = null;
+
+// Initialize worker message handler (called once when worker is set)
+function initWorkerMessageHandler() {
+	if (workerMessageHandler || !cryptoWorkerRef) {
+		return;
+	}
+
+	workerMessageHandler = message => {
+		const request = pendingRequests.get(message.id);
+		if (request) {
+			// Clear timeout
+			if (request.timeout) {
+				clearTimeout(request.timeout);
+			}
+			// Remove from pending
+			pendingRequests.delete(message.id);
+			// Resolve or reject
+			if (message.error) {
+				request.reject(new Error(message.error));
+			} else {
+				request.resolve(message.result);
+			}
+		}
+	};
+
+	cryptoWorkerRef.on('message', workerMessageHandler);
+}
+
+// Set worker reference (called by main.js)
+function setCryptoWorker(worker) {
+	cryptoWorkerRef = worker;
+	// Initialize message handler when worker is set
+	if (worker) {
+		initWorkerMessageHandler();
+	}
+}
+
+// Cleanup worker - reject all pending requests (called on worker exit/error)
+function cleanupWorker() {
+	// Reject all pending requests to prevent hanging promises
+	for (const [messageId, request] of pendingRequests.entries()) {
+		if (request.timeout) {
+			clearTimeout(request.timeout);
+		}
+		request.reject(new Error('Worker terminated'));
+		pendingRequests.delete(messageId);
+	}
+
+	// Clear worker reference
+	cryptoWorkerRef = null;
+	workerMessageHandler = null;
+}
+
+// Helper to call worker for crypto (if available)
+// Uses pendingRequests Map to prevent listener leaks and properly handle timeouts
+async function callWorkerCrypto(type, data) {
+	if (!cryptoWorkerRef) {
+		return null; // No worker, use local crypto
+	}
+
+	// Initialize handler if not already done
+	initWorkerMessageHandler();
+
+	return new Promise((resolve, reject) => {
+		// Use crypto.randomUUID() for better uniqueness
+		const messageId = crypto.randomUUID();
+
+		// Store request
+		pendingRequests.set(messageId, {
+			resolve,
+			reject,
+			timeout: null,
+		});
+
+		// Set timeout (will be cleared on success)
+		const timeout = setTimeout(() => {
+			pendingRequests.delete(messageId);
+			reject(new Error('Crypto worker timeout'));
+		}, 30000);
+
+		// Update timeout reference
+		pendingRequests.get(messageId).timeout = timeout;
+
+		// Send message
+		cryptoWorkerRef.postMessage({
+			type: type,
+			id: messageId,
+			data: data,
+		});
+	});
+}
 
 console.log('[Vault] Initializing vault database...');
 
@@ -10,7 +112,8 @@ console.log('[Vault] Initializing vault database...');
 const PBKDF2_ITERATIONS = 100000; // Reduced to 100k for better performance while maintaining security
 const SALT_LENGTH = 32; // 256 bits
 const KEY_LENGTH = 32; // 256 bits for AES-256
-const IV_LENGTH = 16; // 128 bits for AES IV
+const IV_LENGTH = 12; // 96 bits for GCM (recommended size, not 16)
+const AUTH_TAG_LENGTH = 16; // 128 bits for GCM auth tag
 const MIN_MASTER_PASSWORD_LENGTH = 12; // Increased minimum length
 const COMPLEXITY_REQUIREMENTS = {
 	minLength: 12,
@@ -46,22 +149,78 @@ const dbPath = getDatabasePath();
 
 // Migration: Check if old database exists in db/ folder and migrate it
 const oldDbPath = path.join(__dirname, 'vault.db');
-if (fs.existsSync(oldDbPath) && !fs.existsSync(dbPath)) {
-	console.log('[Vault] Migrating database from old location to secure location...');
-	try {
-		// Ensure new directory exists
-		const newDbDir = path.dirname(dbPath);
-		if (!fs.existsSync(newDbDir)) {
-			fs.mkdirSync(newDbDir, { recursive: true, mode: 0o700 });
+if (fs.existsSync(oldDbPath)) {
+	// Check if new database exists and has entries
+	let shouldMigrate = false;
+	if (!fs.existsSync(dbPath)) {
+		// New database doesn't exist - definitely migrate
+		shouldMigrate = true;
+	} else {
+		// New database exists - check if it's empty
+		try {
+			const tempDb = new Database(dbPath);
+			// First verify that entries table exists (old DB might have different schema)
+			try {
+				// Check if entries table exists
+				const tableCheck = tempDb.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='entries'").get();
+				if (!tableCheck) {
+					// Table doesn't exist - this might be an old DB with different schema
+					tempDb.close();
+					if (process.env.NODE_ENV !== 'production') {
+						console.log('[Vault] entries table does not exist in new database, will attempt migration...');
+					}
+					shouldMigrate = true;
+				} else {
+					// Table exists - check if it's empty
+					const entryCount = tempDb.prepare('SELECT COUNT(*) as count FROM entries').get();
+					tempDb.close();
+					if (!entryCount || entryCount.count === 0) {
+						// New database is empty - migrate from old one
+						shouldMigrate = true;
+						console.log('[Vault] New database is empty, migrating from old location...');
+					}
+				}
+			} catch (tableError) {
+				// Error checking table or querying entries - might be schema mismatch
+				tempDb.close();
+				if (process.env.NODE_ENV !== 'production') {
+					console.log(
+						'[Vault] Could not verify entries table (possible schema mismatch), will attempt migration:',
+						tableError.message
+					);
+				}
+				shouldMigrate = true;
+			}
+		} catch (error) {
+			// If we can't open/check database, assume we should migrate
+			if (process.env.NODE_ENV !== 'production') {
+				console.log('[Vault] Could not check new database, will attempt migration:', error.message);
+			}
+			shouldMigrate = true;
 		}
-		// Copy database to new location
-		fs.copyFileSync(oldDbPath, dbPath);
-		// Set secure permissions
-		fs.chmodSync(dbPath, 0o600); // Read/write for owner only
-		console.log('[Vault] Database migrated successfully to:', dbPath);
-	} catch (error) {
-		console.error('[Vault] Migration failed:', error);
-		console.log('[Vault] Continuing with new database location...');
+	}
+
+	if (shouldMigrate) {
+		console.log('[Vault] Migrating database from old location to secure location...');
+		try {
+			// Ensure new directory exists
+			const newDbDir = path.dirname(dbPath);
+			if (!fs.existsSync(newDbDir)) {
+				fs.mkdirSync(newDbDir, { recursive: true, mode: 0o700 });
+			}
+			// If new database exists but is empty, remove it first
+			if (fs.existsSync(dbPath)) {
+				fs.unlinkSync(dbPath);
+			}
+			// Copy database to new location
+			fs.copyFileSync(oldDbPath, dbPath);
+			// Set secure permissions
+			fs.chmodSync(dbPath, 0o600); // Read/write for owner only
+			console.log('[Vault] Database migrated successfully to:', dbPath);
+		} catch (error) {
+			console.error('[Vault] Migration failed:', error);
+			console.log('[Vault] Continuing with new database location...');
+		}
 	}
 }
 
@@ -102,6 +261,7 @@ try {
 			category TEXT DEFAULT 'personal',
 			salt TEXT NOT NULL,
 			iv TEXT NOT NULL,
+			enc_version TEXT DEFAULT 'gcm',
 			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 			last_modified DATETIME DEFAULT CURRENT_TIMESTAMP,
 			access_count INTEGER DEFAULT 0,
@@ -112,11 +272,53 @@ try {
 	// Check if category column exists, if not add it
 	try {
 		db.exec('SELECT category FROM entries LIMIT 1');
-		console.log('[Vault] Category column already exists');
+		if (process.env.NODE_ENV !== 'production') {
+			console.log('[Vault] Category column already exists');
+		}
 	} catch (error) {
-		console.log('[Vault] Adding category column to existing database...');
+		if (process.env.NODE_ENV !== 'production') {
+			console.log('[Vault] Adding category column to existing database...');
+		}
 		db.exec('ALTER TABLE entries ADD COLUMN category TEXT DEFAULT "personal"');
-		console.log('[Vault] Category column added successfully');
+		if (process.env.NODE_ENV !== 'production') {
+			console.log('[Vault] Category column added successfully');
+		}
+	}
+
+	// Check if enc_version column exists, if not add it
+	try {
+		db.exec('SELECT enc_version FROM entries LIMIT 1');
+		if (process.env.NODE_ENV !== 'production') {
+			console.log('[Vault] enc_version column already exists');
+		}
+	} catch (error) {
+		if (process.env.NODE_ENV !== 'production') {
+			console.log('[Vault] Adding enc_version column to existing database...');
+		}
+		try {
+			db.exec("ALTER TABLE entries ADD COLUMN enc_version TEXT DEFAULT 'cbc'");
+			// Update existing entries to 'cbc' (legacy) - they will be migrated to 'gcm' on access
+			// Only update if entries table exists and has rows
+			try {
+				db.exec("UPDATE entries SET enc_version = 'cbc' WHERE enc_version IS NULL");
+			} catch (updateError) {
+				// Table might be empty or not exist - that's OK, column was added
+				if (process.env.NODE_ENV !== 'production') {
+					console.log('[Vault] No entries to update (table may be empty)');
+				}
+			}
+			if (process.env.NODE_ENV !== 'production') {
+				console.log('[Vault] enc_version column added successfully');
+			}
+		} catch (alterError) {
+			// Column might already exist or table structure issue - log but don't fail
+			if (process.env.NODE_ENV !== 'production') {
+				console.log(
+					'[Vault] Could not add enc_version column (may already exist or schema issue):',
+					alterError.message
+				);
+			}
+		}
 	}
 
 	// Create security metadata table
@@ -289,39 +491,241 @@ function validateMasterPassword(password) {
 	return true;
 }
 
-function generateSalt() {
-	return CryptoJS.lib.WordArray.random(SALT_LENGTH).toString();
+// All cryptographic operations delegated to worker thread
+// This minimizes sensitive data lifetime in main thread and isolates crypto operations
+
+// Generate salt via worker (fallback to local if worker unavailable)
+async function generateSalt() {
+	if (cryptoWorkerRef) {
+		try {
+			const result = await callWorkerCrypto('generateSalt', {});
+			if (result && result.salt) {
+				return result.salt;
+			}
+		} catch (error) {
+			console.warn('[Vault] Worker generateSalt failed, using local crypto:', error.message);
+		}
+	}
+	// Fallback to local crypto
+	return crypto.randomBytes(SALT_LENGTH).toString('hex');
 }
 
-function generateIV() {
-	return CryptoJS.lib.WordArray.random(IV_LENGTH).toString();
+// Generate IV via worker (fallback to local if worker unavailable)
+async function generateIV() {
+	if (cryptoWorkerRef) {
+		try {
+			const result = await callWorkerCrypto('generateIV', {});
+			if (result && result.iv) {
+				return result.iv;
+			}
+		} catch (error) {
+			console.warn('[Vault] Worker generateIV failed, using local crypto:', error.message);
+		}
+	}
+	// Fallback to local crypto
+	return crypto.randomBytes(IV_LENGTH).toString('hex'); // 12 bytes for GCM
 }
 
-function deriveKey(password, salt) {
-	return CryptoJS.PBKDF2(password, salt, {
-		keySize: KEY_LENGTH / 4, // CryptoJS uses 32-bit words
-		iterations: PBKDF2_ITERATIONS,
-	});
+// Encrypt using worker (fallback to local if worker unavailable)
+// Returns string format encrypted:authTag for database storage
+// Note: Password reference cleared after use (best effort - JavaScript GC doesn't guarantee secure wipe)
+async function encrypt(text, password, salt, iv) {
+	if (cryptoWorkerRef) {
+		try {
+			const result = await callWorkerCrypto('encryptVault', {
+				text: text,
+				password: password,
+				salt: salt,
+				iv: iv,
+			});
+			if (result && result.encrypted) {
+				// Worker returns object { encrypted, authTag }, convert to string format for DB
+				const encryptedData = result.encrypted;
+				if (typeof encryptedData === 'object' && encryptedData.encrypted && encryptedData.authTag) {
+					// New object format - convert to string for database
+					password = null; // Best effort
+					return encryptedData.encrypted + ':' + encryptedData.authTag;
+				} else if (typeof encryptedData === 'string') {
+					// Legacy string format (already in correct format)
+					password = null; // Best effort
+					return encryptedData;
+				}
+			}
+		} catch (error) {
+			if (process.env.NODE_ENV !== 'production') {
+				console.warn('[Vault] Worker encrypt failed, using local crypto:', error.message);
+			}
+		}
+	}
+	// Fallback to local crypto
+	const key = crypto.pbkdf2Sync(password, Buffer.from(salt, 'hex'), PBKDF2_ITERATIONS, KEY_LENGTH, 'sha256');
+	const ivBuffer = Buffer.from(iv, 'hex');
+
+	// Use GCM mode for authenticated encryption
+	const cipher = crypto.createCipheriv('aes-256-gcm', key, ivBuffer);
+	cipher.setAAD(Buffer.from('password-manager-vault', 'utf8')); // Additional authenticated data
+
+	let encrypted = cipher.update(text, 'utf8', 'hex');
+	encrypted += cipher.final('hex');
+
+	const authTag = cipher.getAuthTag();
+
+	// Clear key from memory (best effort in JS)
+	key.fill(0);
+	// Clear password reference (best effort)
+	password = null;
+
+	// Return format: encrypted:authTag (both hex strings) for database storage
+	return encrypted + ':' + authTag.toString('hex');
 }
 
-function encrypt(text, password, salt, iv) {
-	const key = deriveKey(password, salt);
-	return CryptoJS.AES.encrypt(text, key, { iv: CryptoJS.enc.Hex.parse(iv) }).toString();
-}
-
-function decrypt(ciphertext, password, salt, iv) {
+// Decrypt using worker (fallback to local if worker unavailable) with legacy support
+// Automatically migrates legacy CBC data to GCM format
+// Note: Password reference cleared after use (best effort - JavaScript GC doesn't guarantee secure wipe)
+// Decrypt function - uses enc_version to determine format (not heuristics)
+// encVersion: 'gcm' for new format, 'cbc' or null for legacy
+async function decrypt(ciphertextWithTag, password, salt, iv, entryId = null, encVersion = null) {
 	try {
-		const key = deriveKey(password, salt);
-		const bytes = CryptoJS.AES.decrypt(ciphertext, key, { iv: CryptoJS.enc.Hex.parse(iv) });
-		return bytes.toString(CryptoJS.enc.Utf8);
+		// Determine encryption version
+		// If encVersion not provided, try to get it from database
+		if (!encVersion && entryId) {
+			const stmt = db.prepare(`SELECT enc_version FROM entries WHERE id = ?`);
+			const row = stmt.get(entryId);
+			encVersion = row?.enc_version || null;
+		}
+
+		// Use enc_version to determine format (not heuristics)
+		// Only 'gcm' is treated as GCM format, null or 'cbc' are treated as legacy CBC
+		const isGCM = encVersion === 'gcm';
+
+		if (isGCM) {
+			// GCM format - try worker first
+			if (cryptoWorkerRef) {
+				try {
+					const result = await callWorkerCrypto('decryptVault', {
+						ciphertext: ciphertextWithTag,
+						password: password,
+						salt: salt,
+						iv: iv,
+					});
+					if (result && result.decrypted) {
+						password = null; // Best effort
+						return result.decrypted;
+					}
+				} catch (error) {
+					if (process.env.NODE_ENV !== 'production') {
+						console.warn('[Vault] Worker decrypt failed, trying local crypto:', error.message);
+					}
+				}
+			}
+
+			// Fallback to local crypto for GCM
+			const parts = ciphertextWithTag.split(':');
+			if (parts.length !== 2) {
+				// GCM format requires encrypted:authTag format
+				// If format is incorrect, data is corrupted - don't silently fallback to legacy
+				if (process.env.NODE_ENV !== 'production') {
+					console.error('[Vault] GCM format error: expected encrypted:authTag, got invalid format');
+				}
+				password = null; // Best effort
+				return null;
+			}
+
+			const encrypted = parts[0];
+			const authTagHex = parts[1];
+
+			const key = crypto.pbkdf2Sync(password, Buffer.from(salt, 'hex'), PBKDF2_ITERATIONS, KEY_LENGTH, 'sha256');
+			const ivBuffer = Buffer.from(iv, 'hex');
+			const authTag = Buffer.from(authTagHex, 'hex');
+
+			const decipher = crypto.createDecipheriv('aes-256-gcm', key, ivBuffer);
+			decipher.setAAD(Buffer.from('password-manager-vault', 'utf8'));
+			decipher.setAuthTag(authTag);
+
+			let decrypted = decipher.update(encrypted, 'hex', 'utf8');
+			decrypted += decipher.final('utf8');
+
+			key.fill(0);
+			password = null;
+			return decrypted;
+		}
+
+		// Legacy CBC format (for migration)
+		const result = await decryptLegacy(ciphertextWithTag, password, salt, iv, entryId);
+		password = null; // Best effort
+		return result;
 	} catch (error) {
-		console.error('[Vault] Decryption failed:', error.message);
+		// If GCM fails, try legacy format as fallback
+		if (error.message.includes('Unsupported state') || error.message.includes('bad decrypt')) {
+			const result = await decryptLegacy(ciphertextWithTag, password, salt, iv, entryId);
+			password = null; // Best effort
+			return result;
+		}
+		password = null; // Best effort
+		if (process.env.NODE_ENV !== 'production') {
+			console.error('[Vault] Decryption failed:', error.message);
+		}
 		return null;
 	}
 }
 
-function addEntry(name, username, plainPassword, category, masterPassword) {
-	// Remove sensitive logging
+// Legacy decryption using CryptoJS (for migrating old CBC data to GCM)
+// Automatically re-encrypts to GCM format if entryId is provided
+async function decryptLegacy(ciphertext, password, salt, iv, entryId = null) {
+	try {
+		// Parse salt as hex (salt is stored as hex string in database)
+		const saltHex = CryptoJS.enc.Hex.parse(salt);
+		const key = CryptoJS.PBKDF2(password, saltHex, {
+			keySize: KEY_LENGTH / 4, // CryptoJS uses 32-bit words
+			iterations: PBKDF2_ITERATIONS,
+		});
+		const bytes = CryptoJS.AES.decrypt(ciphertext, key, { iv: CryptoJS.enc.Hex.parse(iv) });
+		const decrypted = bytes.toString(CryptoJS.enc.Utf8);
+
+		// If decryption succeeded and entryId provided, re-encrypt to GCM format
+		if (decrypted && decrypted.length > 0 && entryId) {
+			try {
+				// Re-encrypt with new GCM format
+				const newSalt = await generateSalt();
+				const newIV = await generateIV();
+				const newEncrypted = await encrypt(decrypted, password, newSalt, newIV);
+
+				// Update entry in database with new GCM format
+				const updateStmt = db.prepare(`
+					UPDATE entries 
+					SET encrypted_password = ?, salt = ?, iv = ?, enc_version = 'gcm', last_modified = CURRENT_TIMESTAMP
+					WHERE id = ?
+				`);
+				updateStmt.run(newEncrypted, newSalt, newIV, entryId);
+
+				if (process.env.NODE_ENV !== 'production') {
+					console.log(`[Vault] Entry ${entryId} migrated from CBC to GCM format`);
+				}
+			} catch (migrationError) {
+				// Migration failed, but decryption succeeded - log warning
+				if (process.env.NODE_ENV !== 'production') {
+					console.warn(`[Vault] Failed to migrate entry ${entryId} to GCM:`, migrationError.message);
+					console.log('[Vault] Legacy CBC format decrypted - will retry migration on next access');
+				}
+			}
+		} else if (decrypted && decrypted.length > 0) {
+			// Decryption succeeded but no entryId - log for manual migration
+			if (process.env.NODE_ENV !== 'production') {
+				console.log('[Vault] Legacy CBC format decrypted - consider migrating to GCM');
+			}
+		}
+
+		return decrypted;
+	} catch (error) {
+		if (process.env.NODE_ENV !== 'production') {
+			console.error('[Vault] Legacy decryption failed:', error.message);
+		}
+		return null;
+	}
+}
+
+async function addEntry(name, username, plainPassword, category, masterPassword) {
+	// Note: Don't log masterPassword or plainPassword - minimize sensitive data in logs
 	console.log('[Vault] addEntry called for service:', name);
 
 	// Validate master password complexity
@@ -336,101 +740,123 @@ function addEntry(name, username, plainPassword, category, masterPassword) {
 	}
 
 	try {
-		const salt = generateSalt();
-		const iv = generateIV();
+		// Generate salt and IV
+		const salt = await generateSalt();
+		const iv = await generateIV();
 
-		const encryptedPassword = encrypt(plainPassword, masterPassword, salt, iv);
+		// Encrypt (password will be cleared after use)
+		const encryptedPassword = await encrypt(plainPassword, masterPassword, salt, iv);
+
+		// Clear sensitive references ASAP (best effort in JS)
+		plainPassword = null;
+		masterPassword = null;
 
 		const stmt = db.prepare(`
-      INSERT INTO entries (name, username, encrypted_password, category, salt, iv) 
-      VALUES (?, ?, ?, ?, ?, ?)
+      INSERT INTO entries (name, username, encrypted_password, category, salt, iv, enc_version) 
+      VALUES (?, ?, ?, ?, ?, ?, ?)
     `);
-		const result = stmt.run(name, username || '', encryptedPassword, category || 'personal', salt, iv);
+		const result = stmt.run(name, username || '', encryptedPassword, category || 'personal', salt, iv, 'gcm');
 
 		return result.lastInsertRowid;
 	} catch (error) {
+		// Clear on error too
+		plainPassword = null;
+		masterPassword = null;
 		console.error('[Vault] Error in addEntry:', error);
 		throw error;
 	}
 }
 
-function getAllEntries(masterPassword) {
+// Get all entries WITHOUT passwords (security: don't expose all passwords at once)
+async function getAllEntries() {
 	try {
-		console.log('[Vault] getAllEntries called');
-		if (!masterPassword) {
-			console.error('[Vault] getAllEntries: masterPassword is missing!');
-			throw new Error('Master password is required');
+		if (process.env.NODE_ENV !== 'production') {
+			console.log('[Vault] getAllEntries called');
 		}
 
-		const stmt = db.prepare(`SELECT * FROM entries ORDER BY last_modified DESC`);
+		const stmt = db.prepare(
+			`SELECT id, name, username, category, created_at, last_modified, enc_version FROM entries ORDER BY last_modified DESC`
+		);
 		const rows = stmt.all();
-		console.log('[Vault] Retrieved', rows.length, 'entries from database');
 
 		if (rows.length === 0) {
-			console.log('[Vault] No entries found in database');
+			if (process.env.NODE_ENV !== 'production') {
+				console.log('[Vault] No entries found in database');
+			}
 			return [];
 		}
 
-		const entries = [];
-		const failedEntries = [];
+		// Return entries without passwords - password must be fetched on demand via getEntryPassword()
+		const entries = rows.map(row => ({
+			id: row.id,
+			name: row.name,
+			username: row.username,
+			category: row.category || 'personal',
+			created_at: row.created_at,
+			last_modified: row.last_modified,
+			enc_version: row.enc_version || 'cbc', // Default to 'cbc' for legacy entries
+		}));
 
-		for (const row of rows) {
-			try {
-				// Validate encryption data exists
-				if (!row.salt || !row.iv || !row.encrypted_password) {
-					console.error(`[Vault] Entry ${row.id} (${row.name || 'Unknown'}) missing encryption data`);
-					failedEntries.push({ id: row.id, name: row.name || 'Unknown', reason: 'Missing encryption data' });
-					continue;
-				}
-
-				// Try to decrypt
-				const password = decrypt(row.encrypted_password, masterPassword, row.salt, row.iv);
-				if (password && password.length > 0) {
-					entries.push({
-						id: row.id,
-						name: row.name,
-						username: row.username,
-						password: password,
-						category: row.category || 'personal',
-						created_at: row.created_at,
-						last_modified: row.last_modified,
-					});
-				} else {
-					console.error(`[Vault] Entry ${row.id} (${row.name || 'Unknown'}) decryption returned empty result`);
-					failedEntries.push({ id: row.id, name: row.name || 'Unknown', reason: 'Decryption returned empty' });
-				}
-			} catch (error) {
-				console.error(`[Vault] Failed to decrypt entry ${row.id} (${row.name || 'Unknown'}):`, error.message);
-				failedEntries.push({ id: row.id, name: row.name || 'Unknown', reason: error.message });
-			}
-		}
-
-		console.log('[Vault] Successfully decrypted', entries.length, 'of', rows.length, 'entries');
-
-		if (failedEntries.length > 0) {
-			console.warn('[Vault] Failed to decrypt', failedEntries.length, 'entries:', failedEntries);
-		}
-
-		// If all entries failed to decrypt, this might indicate wrong password
-		if (entries.length === 0 && rows.length > 0) {
-			console.error('[Vault] WARNING: All entries failed to decrypt! This might indicate:');
-			console.error('[Vault] 1. Incorrect master password');
-			console.error('[Vault] 2. Entries encrypted with different password');
-			console.error('[Vault] 3. Database corruption');
-			// Don't throw - return empty array so user can still see the interface
-			// The frontend will show appropriate message
+		if (process.env.NODE_ENV !== 'production') {
+			console.log('[Vault] Retrieved', entries.length, 'entries (without passwords)');
 		}
 
 		return entries;
 	} catch (error) {
-		console.error('[Vault] Error in getAllEntries:', error);
-		// Return empty array instead of throwing to prevent app crash
-		// Log the error for debugging
+		if (process.env.NODE_ENV !== 'production') {
+			console.error('[Vault] Error in getAllEntries:', error);
+		}
 		return [];
 	}
 }
 
-function saveEntryHistory(entryId, masterPassword) {
+// Get password for a single entry (on-demand decryption)
+async function getEntryPassword(entryId, masterPassword) {
+	try {
+		if (!masterPassword) {
+			throw new Error('Master password is required');
+		}
+
+		const stmt = db.prepare(`SELECT encrypted_password, salt, iv, enc_version FROM entries WHERE id = ?`);
+		const row = stmt.get(entryId);
+
+		if (!row) {
+			throw new Error(`Entry ${entryId} not found`);
+		}
+
+		if (!row.salt || !row.iv || !row.encrypted_password) {
+			throw new Error(`Entry ${entryId} missing encryption data`);
+		}
+
+		// Decrypt password (with automatic migration from CBC to GCM)
+		const password = await decrypt(row.encrypted_password, masterPassword, row.salt, row.iv, entryId, row.enc_version);
+
+		if (!password || password.length === 0) {
+			throw new Error(`Failed to decrypt entry ${entryId}`);
+		}
+
+		// Update access statistics
+		const updateStmt = db.prepare(`
+			UPDATE entries 
+			SET access_count = access_count + 1, last_access = CURRENT_TIMESTAMP
+			WHERE id = ?
+		`);
+		updateStmt.run(entryId);
+
+		// Clear masterPassword reference (best effort)
+		masterPassword = null;
+
+		return password;
+	} catch (error) {
+		masterPassword = null; // Best effort
+		if (process.env.NODE_ENV !== 'production') {
+			console.error(`[Vault] Error getting password for entry ${entryId}:`, error.message);
+		}
+		throw error;
+	}
+}
+
+async function saveEntryHistory(entryId, masterPassword) {
 	try {
 		// Get current entry state
 		const getStmt = db.prepare(`SELECT * FROM entries WHERE id = ?`);
@@ -441,7 +867,14 @@ function saveEntryHistory(entryId, masterPassword) {
 		}
 
 		// Decrypt entry data to store in history
-		const decryptedPassword = decrypt(entry.encrypted_password, masterPassword, entry.salt, entry.iv);
+		const decryptedPassword = await decrypt(
+			entry.encrypted_password,
+			masterPassword,
+			entry.salt,
+			entry.iv,
+			entryId,
+			entry.enc_version
+		);
 		if (!decryptedPassword) {
 			console.warn(`[Vault] Cannot save history for entry ${entryId} - decryption failed`);
 			return false;
@@ -456,9 +889,9 @@ function saveEntryHistory(entryId, masterPassword) {
 		};
 
 		// Encrypt history data with master password
-		const historySalt = generateSalt();
-		const historyIV = generateIV();
-		const encryptedHistory = encrypt(JSON.stringify(historyData), masterPassword, historySalt, historyIV);
+		const historySalt = await generateSalt();
+		const historyIV = await generateIV();
+		const encryptedHistory = await encrypt(JSON.stringify(historyData), masterPassword, historySalt, historyIV);
 
 		// Save to history table
 		const historyStmt = db.prepare(`
@@ -487,7 +920,7 @@ function saveEntryHistory(entryId, masterPassword) {
 	}
 }
 
-function getEntryHistory(entryId, masterPassword) {
+async function getEntryHistory(entryId, masterPassword) {
 	try {
 		const stmt = db.prepare(`
 			SELECT * FROM entry_history 
@@ -499,7 +932,8 @@ function getEntryHistory(entryId, masterPassword) {
 		const history = [];
 		for (const row of rows) {
 			try {
-				const decryptedData = decrypt(row.encrypted_data, masterPassword, row.salt, row.iv);
+				// History entries don't need migration (they're already in GCM or will be re-encrypted when entry is updated)
+				const decryptedData = await decrypt(row.encrypted_data, masterPassword, row.salt, row.iv, null);
 				if (decryptedData) {
 					const data = JSON.parse(decryptedData);
 					history.push({
@@ -525,7 +959,7 @@ function getEntryHistory(entryId, masterPassword) {
 	}
 }
 
-function rollbackEntry(entryId, historyId, masterPassword) {
+async function rollbackEntry(entryId, historyId, masterPassword) {
 	try {
 		// Get history entry
 		const historyStmt = db.prepare(`SELECT * FROM entry_history WHERE id = ? AND entry_id = ?`);
@@ -535,8 +969,14 @@ function rollbackEntry(entryId, historyId, masterPassword) {
 			throw new Error('History entry not found');
 		}
 
-		// Decrypt history data
-		const decryptedData = decrypt(historyRow.encrypted_data, masterPassword, historyRow.salt, historyRow.iv);
+		// Decrypt history data (history entries don't need migration)
+		const decryptedData = await decrypt(
+			historyRow.encrypted_data,
+			masterPassword,
+			historyRow.salt,
+			historyRow.iv,
+			null
+		);
 		if (!decryptedData) {
 			throw new Error('Failed to decrypt history data');
 		}
@@ -544,17 +984,18 @@ function rollbackEntry(entryId, historyId, masterPassword) {
 		const historyData = JSON.parse(decryptedData);
 
 		// Save current state to history before rollback
-		saveEntryHistory(entryId, masterPassword);
+		await saveEntryHistory(entryId, masterPassword);
 
 		// Encrypt with new salt/IV for security
-		const newSalt = generateSalt();
-		const newIV = generateIV();
-		const encryptedPassword = encrypt(historyData.password, masterPassword, newSalt, newIV);
+		const newSalt = await generateSalt();
+		const newIV = await generateIV();
+		const encryptedPassword = await encrypt(historyData.password, masterPassword, newSalt, newIV);
 
 		// Update entry with history data
+		// Always set enc_version to 'gcm' when updating (ensures consistency)
 		const updateStmt = db.prepare(`
 			UPDATE entries 
-			SET name = ?, username = ?, encrypted_password = ?, category = ?, salt = ?, iv = ?, last_modified = CURRENT_TIMESTAMP
+			SET name = ?, username = ?, encrypted_password = ?, category = ?, salt = ?, iv = ?, enc_version = 'gcm', last_modified = CURRENT_TIMESTAMP
 			WHERE id = ?
 		`);
 		const result = updateStmt.run(
@@ -579,8 +1020,10 @@ function rollbackEntry(entryId, historyId, masterPassword) {
 	}
 }
 
-function updateEntry(id, name, username, plainPassword, category, masterPassword) {
-	console.log('[Vault] updateEntry called for entry ID:', id);
+async function updateEntry(id, name, username, plainPassword, category, masterPassword) {
+	if (process.env.NODE_ENV !== 'production') {
+		console.log('[Vault] updateEntry called for entry ID:', id);
+	}
 
 	// Validate master password complexity
 	try {
@@ -595,7 +1038,7 @@ function updateEntry(id, name, username, plainPassword, category, masterPassword
 
 	try {
 		// Get existing entry to check if password changed
-		const getStmt = db.prepare(`SELECT encrypted_password, salt, iv FROM entries WHERE id = ?`);
+		const getStmt = db.prepare(`SELECT encrypted_password, salt, iv, enc_version FROM entries WHERE id = ?`);
 		const existingEntry = getStmt.get(id);
 
 		if (!existingEntry) {
@@ -603,18 +1046,29 @@ function updateEntry(id, name, username, plainPassword, category, masterPassword
 		}
 
 		// Save current state to history before updating
-		saveEntryHistory(id, masterPassword);
+		await saveEntryHistory(id, masterPassword);
 
 		// Decrypt old password to check if it changed
-		const oldPassword = decrypt(existingEntry.encrypted_password, masterPassword, existingEntry.salt, existingEntry.iv);
+		const oldPassword = await decrypt(
+			existingEntry.encrypted_password,
+			masterPassword,
+			existingEntry.salt,
+			existingEntry.iv,
+			id,
+			existingEntry.enc_version
+		);
+
+		if (!oldPassword) {
+			throw new Error('Failed to decrypt existing entry. Master password may be incorrect.');
+		}
 
 		// Generate new salt and IV if password changed, otherwise keep existing ones
 		let salt, iv, encryptedPassword;
 		if (oldPassword !== plainPassword) {
 			// Password changed - generate new salt and IV for security
-			salt = generateSalt();
-			iv = generateIV();
-			encryptedPassword = encrypt(plainPassword, masterPassword, salt, iv);
+			salt = await generateSalt();
+			iv = await generateIV();
+			encryptedPassword = await encrypt(plainPassword, masterPassword, salt, iv);
 		} else {
 			// Password unchanged - keep existing salt and IV
 			salt = existingEntry.salt;
@@ -623,9 +1077,10 @@ function updateEntry(id, name, username, plainPassword, category, masterPassword
 		}
 
 		// Update entry with new values
+		// Always set enc_version to 'gcm' when updating (ensures consistency)
 		const stmt = db.prepare(`
 			UPDATE entries 
-			SET name = ?, username = ?, encrypted_password = ?, category = ?, salt = ?, iv = ?, last_modified = CURRENT_TIMESTAMP
+			SET name = ?, username = ?, encrypted_password = ?, category = ?, salt = ?, iv = ?, enc_version = 'gcm', last_modified = CURRENT_TIMESTAMP
 			WHERE id = ?
 		`);
 		const result = stmt.run(name, username || '', encryptedPassword, category || 'personal', salt, iv, id);
@@ -634,10 +1089,14 @@ function updateEntry(id, name, username, plainPassword, category, masterPassword
 			throw new Error('Failed to update entry');
 		}
 
-		console.log('[Vault] Entry updated successfully');
+		if (process.env.NODE_ENV !== 'production') {
+			console.log('[Vault] Entry updated successfully');
+		}
 		return true;
 	} catch (error) {
-		console.error('[Vault] Error in updateEntry:', error);
+		if (process.env.NODE_ENV !== 'production') {
+			console.error('[Vault] Error in updateEntry:', error);
+		}
 		throw error;
 	}
 }
@@ -656,12 +1115,12 @@ function deleteEntry(id) {
 	}
 }
 
-function changeMasterPassword(oldMasterPassword, newMasterPassword) {
+async function changeMasterPassword(oldMasterPassword, newMasterPassword) {
 	console.log('[Vault] changeMasterPassword called');
 
 	// Validate old password first
 	try {
-		const isValid = testMasterPassword(oldMasterPassword);
+		const isValid = await testMasterPassword(oldMasterPassword);
 		if (!isValid) {
 			throw new Error('Current master password is incorrect');
 		}
@@ -673,11 +1132,18 @@ function changeMasterPassword(oldMasterPassword, newMasterPassword) {
 	// Diagnostic: Check if we can decrypt entries with the provided password
 	// This helps identify if the password is wrong or if specific entries are problematic
 	try {
-		const testStmt = db.prepare(`SELECT id, name, encrypted_password, salt, iv FROM entries LIMIT 5`);
+		const testStmt = db.prepare(`SELECT id, name, encrypted_password, salt, iv, enc_version FROM entries LIMIT 5`);
 		const testRows = testStmt.all();
 		let canDecryptCount = 0;
 		for (const row of testRows) {
-			const testDecrypt = decrypt(row.encrypted_password, oldMasterPassword, row.salt, row.iv);
+			const testDecrypt = await decrypt(
+				row.encrypted_password,
+				oldMasterPassword,
+				row.salt,
+				row.iv,
+				row.id,
+				row.enc_version
+			);
 			if (testDecrypt) {
 				canDecryptCount++;
 			} else {
@@ -736,16 +1202,29 @@ function changeMasterPassword(oldMasterPassword, newMasterPassword) {
 					continue;
 				}
 
-				const plainPassword = decrypt(row.encrypted_password, oldMasterPassword, row.salt, row.iv);
+				const plainPassword = await decrypt(
+					row.encrypted_password,
+					oldMasterPassword,
+					row.salt,
+					row.iv,
+					row.id,
+					row.enc_version
+				);
 				if (plainPassword && plainPassword.length > 0) {
 					decryptableEntries.push({ ...row, plainPassword });
 				} else {
 					failedEntries.push({ id: row.id, name: row.name || 'Unknown', reason: 'Decryption returned empty result' });
-					console.warn(`[Vault] Cannot decrypt entry ${row.id} (${row.name || 'Unknown'}) - decryption returned empty`);
+					if (process.env.NODE_ENV !== 'production') {
+						console.warn(
+							`[Vault] Cannot decrypt entry ${row.id} (${row.name || 'Unknown'}) - decryption returned empty`
+						);
+					}
 				}
 			} catch (error) {
 				failedEntries.push({ id: row.id, name: row.name || 'Unknown', reason: error.message });
-				console.warn(`[Vault] Error decrypting entry ${row.id} (${row.name || 'Unknown'}):`, error.message);
+				if (process.env.NODE_ENV !== 'production') {
+					console.warn(`[Vault] Error decrypting entry ${row.id} (${row.name || 'Unknown'}):`, error.message);
+				}
 			}
 		}
 
@@ -761,50 +1240,90 @@ function changeMasterPassword(oldMasterPassword, newMasterPassword) {
 			const failedDetails = failedEntries
 				.map(e => `ID ${e.id} (${e.name})${e.reason ? ' - ' + e.reason : ''}`)
 				.join(', ');
-			console.warn(
-				`[Vault] Warning: ${failedEntries.length} entry/entries cannot be decrypted and will be skipped: ${failedDetails}`
+			if (process.env.NODE_ENV !== 'production') {
+				console.warn(
+					`[Vault] Warning: ${failedEntries.length} entry/entries cannot be decrypted and will be skipped: ${failedDetails}`
+				);
+			}
+		}
+
+		if (process.env.NODE_ENV !== 'production') {
+			console.log(
+				`[Vault] ${decryptableEntries.length} entries can be re-encrypted, ${failedEntries.length} will be skipped`
 			);
 		}
 
-		console.log(
-			`[Vault] ${decryptableEntries.length} entries can be re-encrypted, ${failedEntries.length} will be skipped`
-		);
+		// Prepare all encrypted data before transaction (transactions can't be async)
+		const reEncryptedEntries = [];
+		for (const entry of decryptableEntries) {
+			try {
+				// Generate new salt and IV for security
+				const newSalt = await generateSalt();
+				const newIV = await generateIV();
+
+				// Encrypt with new password (we already have plainPassword from the check above)
+				const newEncryptedPassword = await encrypt(entry.plainPassword, newMasterPassword, newSalt, newIV);
+
+				reEncryptedEntries.push({
+					id: entry.id,
+					encryptedPassword: newEncryptedPassword,
+					salt: newSalt,
+					iv: newIV,
+				});
+			} catch (error) {
+				console.error(`[Vault] Error preparing re-encryption for entry ${entry.id}:`, error);
+				throw new Error(`Failed to re-encrypt entry ${entry.id}: ${error.message}`);
+			}
+		}
+
+		// Prepare new master password hash
+		const newSalt = await generateSalt();
+		let newHash;
+		if (cryptoWorkerRef) {
+			try {
+				const hashResult = await callWorkerCrypto('hashPBKDF2', {
+					password: newMasterPassword,
+					salt: newSalt,
+				});
+				if (hashResult && hashResult.hash) {
+					newHash = hashResult.hash;
+				} else {
+					throw new Error('Worker hashPBKDF2 returned no result');
+				}
+			} catch (error) {
+				console.warn('[Vault] Worker hashPBKDF2 failed, using local crypto:', error.message);
+				newHash = crypto
+					.pbkdf2Sync(newMasterPassword, Buffer.from(newSalt, 'hex'), PBKDF2_ITERATIONS, KEY_LENGTH, 'sha256')
+					.toString('hex');
+			}
+		} else {
+			newHash = crypto
+				.pbkdf2Sync(newMasterPassword, Buffer.from(newSalt, 'hex'), PBKDF2_ITERATIONS, KEY_LENGTH, 'sha256')
+				.toString('hex');
+		}
 
 		// Use a transaction to ensure atomicity
 		const transaction = db.transaction(() => {
 			// Prepare statements inside transaction
 			const updateStmt = db.prepare(`
 				UPDATE entries 
-				SET encrypted_password = ?, salt = ?, iv = ?, last_modified = CURRENT_TIMESTAMP
+				SET encrypted_password = ?, salt = ?, iv = ?, enc_version = 'gcm', last_modified = CURRENT_TIMESTAMP
 				WHERE id = ?
 			`);
 
 			// Only re-encrypt entries that we successfully decrypted
-			for (const entry of decryptableEntries) {
+			for (const entry of reEncryptedEntries) {
 				try {
-					// Generate new salt and IV for security
-					const newSalt = generateSalt();
-					const newIV = generateIV();
-
-					// Encrypt with new password (we already have plainPassword from the check above)
-					const newEncryptedPassword = encrypt(entry.plainPassword, newMasterPassword, newSalt, newIV);
-
 					// Update entry
-					updateStmt.run(newEncryptedPassword, newSalt, newIV, entry.id);
+					updateStmt.run(entry.encryptedPassword, entry.salt, entry.iv, entry.id);
 					console.log(`[Vault] Successfully re-encrypted entry ${entry.id}`);
 				} catch (error) {
-					console.error(`[Vault] Error re-encrypting entry ${entry.id}:`, error);
-					throw new Error(`Failed to re-encrypt entry ${entry.id}: ${error.message}`);
+					console.error(`[Vault] Error updating entry ${entry.id}:`, error);
+					throw new Error(`Failed to update entry ${entry.id}: ${error.message}`);
 				}
 			}
 
 			// Update master password hash
-			const newSalt = generateSalt();
-			const newHash = CryptoJS.PBKDF2(newMasterPassword, newSalt, {
-				keySize: KEY_LENGTH / 4,
-				iterations: PBKDF2_ITERATIONS,
-			}).toString();
-
 			const updateHashStmt = db.prepare(`
 				UPDATE security_metadata 
 				SET master_password_hash = ?, password_salt = ?, last_modified = CURRENT_TIMESTAMP
@@ -839,7 +1358,7 @@ function changeMasterPassword(oldMasterPassword, newMasterPassword) {
 	}
 }
 
-function testMasterPassword(masterPassword) {
+async function testMasterPassword(masterPassword) {
 	try {
 		// Check if account is locked
 		const lockStmt = db.prepare(`SELECT locked_until FROM security_metadata WHERE id = 1`);
@@ -863,11 +1382,30 @@ function testMasterPassword(masterPassword) {
 				validateMasterPassword(masterPassword);
 
 				// Store master password hash for future verification
-				const salt = generateSalt();
-				const hash = CryptoJS.PBKDF2(masterPassword, salt, {
-					keySize: KEY_LENGTH / 4,
-					iterations: PBKDF2_ITERATIONS,
-				}).toString();
+				const salt = await generateSalt();
+				let hash;
+				if (cryptoWorkerRef) {
+					try {
+						const hashResult = await callWorkerCrypto('hashPBKDF2', {
+							password: masterPassword,
+							salt: salt,
+						});
+						if (hashResult && hashResult.hash) {
+							hash = hashResult.hash;
+						} else {
+							throw new Error('Worker hashPBKDF2 returned no result');
+						}
+					} catch (error) {
+						console.warn('[Vault] Worker hashPBKDF2 failed, using local crypto:', error.message);
+						hash = crypto
+							.pbkdf2Sync(masterPassword, Buffer.from(salt, 'hex'), PBKDF2_ITERATIONS, KEY_LENGTH, 'sha256')
+							.toString('hex');
+					}
+				} else {
+					hash = crypto
+						.pbkdf2Sync(masterPassword, Buffer.from(salt, 'hex'), PBKDF2_ITERATIONS, KEY_LENGTH, 'sha256')
+						.toString('hex');
+				}
 
 				const updateStmt = db.prepare(`
 					UPDATE security_metadata 
@@ -887,10 +1425,54 @@ function testMasterPassword(masterPassword) {
 		const hashResult = hashStmt.get();
 
 		if (hashResult) {
-			const testHash = CryptoJS.PBKDF2(masterPassword, hashResult.password_salt, {
-				keySize: KEY_LENGTH / 4,
-				iterations: PBKDF2_ITERATIONS,
-			}).toString();
+			// Support both hex format (new) and CryptoJS format (legacy)
+			let testHash;
+			try {
+				// Try worker first (hex format)
+				if (cryptoWorkerRef) {
+					try {
+						const hashResult_worker = await callWorkerCrypto('hashPBKDF2', {
+							password: masterPassword,
+							salt: hashResult.password_salt,
+						});
+						if (hashResult_worker && hashResult_worker.hash) {
+							testHash = hashResult_worker.hash;
+						} else {
+							throw new Error('Worker hashPBKDF2 returned no result');
+						}
+					} catch (error) {
+						console.warn('[Vault] Worker hashPBKDF2 failed, using local crypto:', error.message);
+						testHash = crypto
+							.pbkdf2Sync(
+								masterPassword,
+								Buffer.from(hashResult.password_salt, 'hex'),
+								PBKDF2_ITERATIONS,
+								KEY_LENGTH,
+								'sha256'
+							)
+							.toString('hex');
+					}
+				} else {
+					// Try Node crypto (hex format)
+					testHash = crypto
+						.pbkdf2Sync(
+							masterPassword,
+							Buffer.from(hashResult.password_salt, 'hex'),
+							PBKDF2_ITERATIONS,
+							KEY_LENGTH,
+							'sha256'
+						)
+						.toString('hex');
+				}
+			} catch (error) {
+				// Fallback to CryptoJS for legacy format
+				// Parse salt as hex (salt is stored as hex string in database)
+				const saltHex = CryptoJS.enc.Hex.parse(hashResult.password_salt);
+				testHash = CryptoJS.PBKDF2(masterPassword, saltHex, {
+					keySize: KEY_LENGTH / 4,
+					iterations: PBKDF2_ITERATIONS,
+				}).toString();
+			}
 
 			if (testHash === hashResult.master_password_hash) {
 				// Reset failed attempts on successful login
@@ -903,11 +1485,18 @@ function testMasterPassword(masterPassword) {
 		}
 
 		// Fallback: try to decrypt an entry (for backward compatibility)
-		const testStmt = db.prepare(`SELECT encrypted_password, salt, iv FROM entries LIMIT 1`);
+		const testStmt = db.prepare(`SELECT id, encrypted_password, salt, iv, enc_version FROM entries LIMIT 1`);
 		const testRow = testStmt.get();
 
 		if (testRow) {
-			const password = decrypt(testRow.encrypted_password, masterPassword, testRow.salt, testRow.iv);
+			const password = await decrypt(
+				testRow.encrypted_password,
+				masterPassword,
+				testRow.salt,
+				testRow.iv,
+				testRow.id,
+				testRow.enc_version
+			);
 			if (password !== null) {
 				// Reset failed attempts
 				const resetStmt = db.prepare(
@@ -951,12 +1540,12 @@ function getSecurityInfo() {
 
 		return {
 			totalEntries: result.count,
-			encryption: 'AES-256-CBC',
+			encryption: 'AES-256-GCM', // Authenticated encryption with GCM
 			keyDerivation: 'PBKDF2',
 			iterations: PBKDF2_ITERATIONS,
 			saltLength: SALT_LENGTH * 8, // in bits
-			ivLength: IV_LENGTH * 8, // in bits
-			securityLevel: 'Ultra-Maximum',
+			ivLength: IV_LENGTH * 8, // in bits (96 bits for GCM)
+			authTagLength: AUTH_TAG_LENGTH * 8, // in bits (128 bits for GCM)
 			failedAttempts: securityResult ? securityResult.failed_attempts : 0,
 			isLocked:
 				securityResult && securityResult.locked_until ? new Date(securityResult.locked_until) > new Date() : false,
@@ -964,15 +1553,16 @@ function getSecurityInfo() {
 				securityResult && securityResult.locked_until
 					? Math.ceil((new Date(securityResult.locked_until) - new Date()) / (1000 * 60))
 					: 0,
-			encryptionVersion: 'v2.0',
-			databaseEncrypted: false, // Database file is not encrypted, but data inside is encrypted
+			encryptionVersion: 'v2.0', // GCM with authentication
+			databaseEncrypted: false, // Database file is not encrypted, but data inside is encrypted per-entry
 			securityFeatures: {
-				clipboardProtection: true,
-				screenCaptureDetection: SCREEN_CAPTURE_DETECTION,
-				autoLock: true,
-				bruteForceProtection: true,
-				keyloggerProtection: true,
-				networkIsolation: true,
+				accountLockout: true, // Account lockout after failed attempts
+				autoLock: true, // Auto-lock on inactivity
+				perEntryEncryption: true, // Each entry encrypted separately
+				perEntrySalt: true, // Unique salt per entry
+				authenticatedEncryption: true, // GCM provides authentication
+				// Note: Clipboard protection and screen capture detection are UI-level features
+				// and cannot be reliably implemented at backend level
 			},
 		};
 	} catch (error) {
@@ -981,79 +1571,40 @@ function getSecurityInfo() {
 	}
 }
 
-// Enhanced clipboard security function
-function secureClipboardCopy(text, timeout = CLIPBOARD_TIMEOUT) {
-	try {
-		// Copy to clipboard
-		if (navigator && navigator.clipboard) {
-			navigator.clipboard.writeText(text);
-
-			// Clear clipboard after timeout
-			setTimeout(() => {
-				try {
-					navigator.clipboard.writeText('');
-					console.log('[Vault] Clipboard cleared for security');
-				} catch (e) {
-					console.warn('[Vault] Could not clear clipboard:', e);
-				}
-			}, timeout);
-
-			return true;
-		}
-		return false;
-	} catch (error) {
-		console.error('[Vault] Clipboard operation failed:', error);
-		return false;
-	}
-}
-
-// Screen capture detection (basic implementation)
-function detectScreenCapture() {
-	if (!SCREEN_CAPTURE_DETECTION) return false;
-
-	try {
-		// Check for common screen capture indicators
-		const indicators = [
-			'getDisplayMedia' in navigator,
-			'mediaDevices' in navigator && 'getDisplayMedia' in navigator.mediaDevices,
-			'webkitGetUserMedia' in navigator,
-			'mozGetUserMedia' in navigator,
-		];
-
-		// If screen capture is detected, trigger security measures
-		if (indicators.some(Boolean)) {
-			console.warn('[Vault] Potential screen capture detected');
-			return true;
-		}
-
-		return false;
-	} catch (error) {
-		console.error('[Vault] Screen capture detection error:', error);
-		return false;
-	}
-}
+// Note: secureClipboardCopy and detectScreenCapture removed
+// These functions use 'navigator' which is not available in Node.js backend
+// They should be implemented in the renderer/UI layer instead
 
 // Enhanced security cleanup
 function enhancedCleanup() {
 	try {
-		// Clear any sensitive data from memory
-		// Clear clipboard
-		if (navigator && navigator.clipboard) {
-			navigator.clipboard.writeText('').catch(() => {});
-		}
+		// Clear any sensitive data from memory (best effort in Node.js)
+		// Note: Clipboard/screen-capture operations should be done in UI (renderer/preload)
+		// Navigator is not available in Node.js backend
 
 		// Clear console logs in production
 		if (process.env.NODE_ENV === 'production') {
 			console.clear();
 		}
 
-		console.log('[Vault] Enhanced security cleanup completed');
+		if (process.env.NODE_ENV !== 'production') {
+			console.log('[Vault] Enhanced security cleanup completed');
+		}
 	} catch (error) {
-		console.error('[Vault] Error during enhanced cleanup:', error);
+		if (process.env.NODE_ENV !== 'production') {
+			console.error('[Vault] Error during enhanced cleanup:', error);
+		}
 	}
 }
 
-function diagnoseEntry(entryId, masterPassword) {
+// Diagnostic function (DEV only - never expose in production)
+async function diagnoseEntry(entryId, masterPassword) {
+	const DEBUG_RECOVERY = process.env.DEBUG_RECOVERY === 'true' || process.env.NODE_ENV !== 'production';
+
+	if (!DEBUG_RECOVERY) {
+		throw new Error('Diagnostic functions are only available in development mode');
+	}
+
 	try {
 		const stmt = db.prepare(`SELECT * FROM entries WHERE id = ?`);
 		const row = stmt.get(entryId);
@@ -1068,6 +1619,7 @@ function diagnoseEntry(entryId, masterPassword) {
 			hasEncryptedPassword: !!row.encrypted_password,
 			hasSalt: !!row.salt,
 			hasIV: !!row.iv,
+			encVersion: row.enc_version || 'cbc',
 			saltLength: row.salt ? row.salt.length : 0,
 			ivLength: row.iv ? row.iv.length : 0,
 			encryptedPasswordLength: row.encrypted_password ? row.encrypted_password.length : 0,
@@ -1091,7 +1643,14 @@ function diagnoseEntry(entryId, masterPassword) {
 		// Try to decrypt
 		if (row.encrypted_password && row.salt && row.iv) {
 			try {
-				const decrypted = decrypt(row.encrypted_password, masterPassword, row.salt, row.iv);
+				const decrypted = await decrypt(
+					row.encrypted_password,
+					masterPassword,
+					row.salt,
+					row.iv,
+					row.id,
+					row.enc_version
+				);
 				if (decrypted && decrypted.length > 0) {
 					diagnostics.canDecrypt = true;
 					diagnostics.decryptedLength = decrypted.length;
@@ -1111,7 +1670,7 @@ function diagnoseEntry(entryId, masterPassword) {
 	}
 }
 
-function setPasswordHint(hint, masterPassword) {
+async function setPasswordHint(hint, masterPassword) {
 	try {
 		if (!hint || !hint.trim()) {
 			// Clear hint if empty
@@ -1126,9 +1685,9 @@ function setPasswordHint(hint, masterPassword) {
 		}
 
 		// Encrypt hint with master password
-		const hintSalt = generateSalt();
-		const hintIV = generateIV();
-		const encryptedHint = encrypt(hint.trim(), masterPassword, hintSalt, hintIV);
+		const hintSalt = await generateSalt();
+		const hintIV = await generateIV();
+		const encryptedHint = await encrypt(hint.trim(), masterPassword, hintSalt, hintIV);
 
 		// Store encrypted hint
 		const stmt = db.prepare(`
@@ -1146,7 +1705,7 @@ function setPasswordHint(hint, masterPassword) {
 	}
 }
 
-function getPasswordHint(masterPassword) {
+async function getPasswordHint(masterPassword) {
 	try {
 		const stmt = db.prepare(`SELECT password_hint, hint_salt, hint_iv FROM security_metadata WHERE id = 1`);
 		const result = stmt.get();
@@ -1159,8 +1718,8 @@ function getPasswordHint(masterPassword) {
 			return { hint: null, error: 'decryption_failed' };
 		}
 
-		// Decrypt hint
-		const decryptedHint = decrypt(result.password_hint, masterPassword, result.hint_salt, result.hint_iv);
+		// Decrypt hint (hints don't need migration)
+		const decryptedHint = await decrypt(result.password_hint, masterPassword, result.hint_salt, result.hint_iv, null);
 
 		if (!decryptedHint) {
 			// Decryption failed - wrong password or corrupted data
@@ -1177,43 +1736,8 @@ function getPasswordHint(masterPassword) {
 	}
 }
 
-function setPasswordHint(hint, masterPassword) {
-	try {
-		if (!hint || !hint.trim()) {
-			// Clear hint if empty
-			const clearStmt = db.prepare(`
-				UPDATE security_metadata 
-				SET password_hint = NULL, hint_salt = NULL, hint_iv = NULL 
-				WHERE id = 1
-			`);
-			clearStmt.run();
-			console.log('[Vault] Password hint cleared');
-			return true;
-		}
-
-		// Encrypt hint with master password
-		const hintSalt = generateSalt();
-		const hintIV = generateIV();
-		const encryptedHint = encrypt(hint.trim(), masterPassword, hintSalt, hintIV);
-
-		// Store encrypted hint
-		const stmt = db.prepare(`
-			UPDATE security_metadata 
-			SET password_hint = ?, hint_salt = ?, hint_iv = ? 
-			WHERE id = 1
-		`);
-		stmt.run(encryptedHint, hintSalt, hintIV);
-
-		console.log('[Vault] Password hint set successfully');
-		return true;
-	} catch (error) {
-		console.error('[Vault] Error setting password hint:', error);
-		throw error;
-	}
-}
-
 // Recovery Questions Functions
-function setRecoveryQuestions(questions, masterPassword) {
+async function setRecoveryQuestions(questions, masterPassword) {
 	try {
 		// Validate input
 		if (!Array.isArray(questions) || questions.length === 0) {
@@ -1241,11 +1765,42 @@ function setRecoveryQuestions(questions, masterPassword) {
 			}
 
 			// Hash answer (like password) - can verify without master password
-			const answerSalt = generateSalt();
-			const answerHash = CryptoJS.PBKDF2(q.answer.trim().toLowerCase(), answerSalt, {
-				keySize: KEY_LENGTH / 4,
-				iterations: PBKDF2_ITERATIONS,
-			}).toString();
+			const answerSalt = await generateSalt();
+			let answerHash;
+			if (cryptoWorkerRef) {
+				try {
+					const hashResult = await callWorkerCrypto('hashPBKDF2', {
+						password: q.answer.trim().toLowerCase(),
+						salt: answerSalt,
+					});
+					if (hashResult && hashResult.hash) {
+						answerHash = hashResult.hash;
+					} else {
+						throw new Error('Worker hashPBKDF2 returned no result');
+					}
+				} catch (error) {
+					console.warn('[Vault] Worker hashPBKDF2 failed, using local crypto:', error.message);
+					answerHash = crypto
+						.pbkdf2Sync(
+							q.answer.trim().toLowerCase(),
+							Buffer.from(answerSalt, 'hex'),
+							PBKDF2_ITERATIONS,
+							KEY_LENGTH,
+							'sha256'
+						)
+						.toString('hex');
+				}
+			} else {
+				answerHash = crypto
+					.pbkdf2Sync(
+						q.answer.trim().toLowerCase(),
+						Buffer.from(answerSalt, 'hex'),
+						PBKDF2_ITERATIONS,
+						KEY_LENGTH,
+						'sha256'
+					)
+					.toString('hex');
+			}
 
 			insertStmt.run(i + 1, q.question.trim(), answerHash, answerSalt);
 		}
@@ -1258,7 +1813,7 @@ function setRecoveryQuestions(questions, masterPassword) {
 	}
 }
 
-function verifyRecoveryQuestions(answers) {
+async function verifyRecoveryQuestions(answers) {
 	try {
 		// Get all recovery questions
 		const stmt = db.prepare(`SELECT * FROM recovery_questions ORDER BY question_number`);
@@ -1280,10 +1835,52 @@ function verifyRecoveryQuestions(answers) {
 
 			try {
 				// Hash the provided answer and compare
-				const testHash = CryptoJS.PBKDF2(providedAnswer, question.answer_salt, {
-					keySize: KEY_LENGTH / 4,
-					iterations: PBKDF2_ITERATIONS,
-				}).toString();
+				// Support both hex format (new) and CryptoJS format (legacy)
+				let testHash;
+				try {
+					if (cryptoWorkerRef) {
+						try {
+							const hashResult = await callWorkerCrypto('hashPBKDF2', {
+								password: providedAnswer,
+								salt: question.answer_salt,
+							});
+							if (hashResult && hashResult.hash) {
+								testHash = hashResult.hash;
+							} else {
+								throw new Error('Worker hashPBKDF2 returned no result');
+							}
+						} catch (error) {
+							console.warn('[Vault] Worker hashPBKDF2 failed, using local crypto:', error.message);
+							testHash = crypto
+								.pbkdf2Sync(
+									providedAnswer,
+									Buffer.from(question.answer_salt, 'hex'),
+									PBKDF2_ITERATIONS,
+									KEY_LENGTH,
+									'sha256'
+								)
+								.toString('hex');
+						}
+					} else {
+						testHash = crypto
+							.pbkdf2Sync(
+								providedAnswer,
+								Buffer.from(question.answer_salt, 'hex'),
+								PBKDF2_ITERATIONS,
+								KEY_LENGTH,
+								'sha256'
+							)
+							.toString('hex');
+					}
+				} catch (error) {
+					// Fallback to CryptoJS for legacy format
+					// Parse salt as hex (salt is stored as hex string in database)
+					const saltHex = CryptoJS.enc.Hex.parse(question.answer_salt);
+					testHash = CryptoJS.PBKDF2(providedAnswer, saltHex, {
+						keySize: KEY_LENGTH / 4,
+						iterations: PBKDF2_ITERATIONS,
+					}).toString();
+				}
 
 				if (testHash === question.answer_hash) {
 					correctCount++;
@@ -1326,16 +1923,21 @@ function getRecoveryQuestions() {
 }
 
 // Backup Codes Functions
+// Increased entropy: 12 characters in format XXXX-XXXX-XXXX
 function generateBackupCode() {
 	const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // Exclude confusing chars (0, O, I, 1)
 	let code = '';
-	for (let i = 0; i < 8; i++) {
-		code += chars.charAt(Math.floor(Math.random() * chars.length));
+
+	// Generate 12 characters
+	for (let i = 0; i < 12; i++) {
+		code += chars.charAt(crypto.randomInt(0, chars.length));
 	}
-	return code;
+
+	// Format as XXXX-XXXX-XXXX for better readability
+	return code.substring(0, 4) + '-' + code.substring(4, 8) + '-' + code.substring(8, 12);
 }
 
-function generateBackupCodes(masterPassword) {
+async function generateBackupCodes(masterPassword) {
 	try {
 		// Invalidate all existing backup codes for security
 		const invalidateStmt = db.prepare(`UPDATE backup_codes SET used = 1 WHERE used = 0`);
@@ -1349,12 +1951,30 @@ function generateBackupCodes(masterPassword) {
 		`);
 
 		for (let i = 0; i < 10; i++) {
-			// Generate 8-character alphanumeric code
+			// Generate 12-character code in format XXXX-XXXX-XXXX
 			const code = generateBackupCode();
 			codes.push(code);
 
-			// Hash the code (not encrypt - so it works even if password changes)
-			const codeHash = CryptoJS.SHA256(code).toString();
+			// Hash the normalized code (without dashes) - so it works even if password changes
+			const normalizedCode = code.replace(/-/g, '').toUpperCase();
+			let codeHash;
+			if (cryptoWorkerRef) {
+				try {
+					const hashResult = await callWorkerCrypto('hashSHA256', {
+						text: normalizedCode,
+					});
+					if (hashResult && hashResult.hash) {
+						codeHash = hashResult.hash;
+					} else {
+						throw new Error('Worker hashSHA256 returned no result');
+					}
+				} catch (error) {
+					console.warn('[Vault] Worker hashSHA256 failed, using local crypto:', error.message);
+					codeHash = crypto.createHash('sha256').update(normalizedCode).digest('hex');
+				}
+			} else {
+				codeHash = crypto.createHash('sha256').update(normalizedCode).digest('hex');
+			}
 			insertStmt.run(codeHash);
 		}
 
@@ -1366,14 +1986,35 @@ function generateBackupCodes(masterPassword) {
 	}
 }
 
-function verifyBackupCode(code) {
+async function verifyBackupCode(code) {
 	try {
-		if (!code || code.length !== 8) {
-			return { verified: false, error: 'Invalid backup code format' };
+		// Remove dashes and convert to uppercase
+		const normalizedCode = code ? code.replace(/-/g, '').toUpperCase() : '';
+
+		// Validate format: should be 12 alphanumeric characters
+		if (!normalizedCode || normalizedCode.length !== 12 || !/^[A-Z2-9]{12}$/.test(normalizedCode)) {
+			return { verified: false, error: 'Invalid backup code format. Expected format: XXXX-XXXX-XXXX' };
 		}
 
-		// Hash the provided code
-		const codeHash = CryptoJS.SHA256(code.toUpperCase()).toString();
+		// Hash the normalized code (without dashes)
+		let codeHash;
+		if (cryptoWorkerRef) {
+			try {
+				const hashResult = await callWorkerCrypto('hashSHA256', {
+					text: normalizedCode,
+				});
+				if (hashResult && hashResult.hash) {
+					codeHash = hashResult.hash;
+				} else {
+					throw new Error('Worker hashSHA256 returned no result');
+				}
+			} catch (error) {
+				console.warn('[Vault] Worker hashSHA256 failed, using local crypto:', error.message);
+				codeHash = crypto.createHash('sha256').update(normalizedCode).digest('hex');
+			}
+		} else {
+			codeHash = crypto.createHash('sha256').update(normalizedCode).digest('hex');
+		}
 
 		// Check if code exists and is unused
 		const stmt = db.prepare(`SELECT id, used FROM backup_codes WHERE code_hash = ?`);
@@ -1418,29 +2059,45 @@ function getBackupCodesStatus() {
 
 // Set up email/SMS recovery
 // This stores an encrypted backup of the master password that can be used for recovery
-function setupEmailSMSRecovery(email, phone, masterPassword) {
+// SECURITY FIX: Don't store master password backup - it breaks the security model
+// Instead, show recovery key ONCE to user - they must save it offline
+async function setupEmailSMSRecovery(email, phone, masterPassword) {
 	try {
-		// Generate a recovery key (this will be used to encrypt the master password backup)
-		const recoveryKey = generateSalt(); // 32 bytes random key
-		const recoveryKeySalt = generateSalt();
-		const recoveryKeyIV = generateIV();
+		// Generate a recovery key (32 bytes random)
+		// This key will be shown ONCE to the user - they must save it offline
+		const recoveryKey = crypto.randomBytes(32).toString('hex');
 
-		// Encrypt the recovery key with a key derived from email+phone (so we can recover it)
-		// For simplicity, we'll use a hash of email+phone as the key
-		const recoveryKeyDerivation = CryptoJS.SHA256(email + phone + 'recovery').toString();
-		const encryptedRecoveryKey = encrypt(recoveryKey, recoveryKeyDerivation, recoveryKeySalt, recoveryKeyIV);
+		// Encrypt the recovery key with a key derived from email+phone
+		// This allows recovery without master password
+		let recoveryKeyDerivation;
+		if (cryptoWorkerRef) {
+			try {
+				const hashResult = await callWorkerCrypto('hashSHA256', {
+					text: email + phone + 'recovery-salt-v1',
+				});
+				if (hashResult && hashResult.hash) {
+					recoveryKeyDerivation = hashResult.hash;
+				} else {
+					throw new Error('Worker hashSHA256 returned no result');
+				}
+			} catch (error) {
+				console.warn('[Vault] Worker hashSHA256 failed, using local crypto:', error.message);
+				recoveryKeyDerivation = crypto
+					.createHash('sha256')
+					.update(email + phone + 'recovery-salt-v1')
+					.digest('hex');
+			}
+		} else {
+			recoveryKeyDerivation = crypto
+				.createHash('sha256')
+				.update(email + phone + 'recovery-salt-v1')
+				.digest('hex');
+		}
+		const recoveryKeySalt = await generateSalt();
+		const recoveryKeyIV = await generateIV();
+		const encryptedRecoveryKey = await encrypt(recoveryKey, recoveryKeyDerivation, recoveryKeySalt, recoveryKeyIV);
 
-		// Encrypt the master password with the recovery key
-		const masterPasswordBackupSalt = generateSalt();
-		const masterPasswordBackupIV = generateIV();
-		const encryptedMasterPasswordBackup = encrypt(
-			masterPassword,
-			recoveryKey,
-			masterPasswordBackupSalt,
-			masterPasswordBackupIV
-		);
-
-		// Store in database
+		// Store encrypted recovery key (NOT master password!)
 		const updateStmt = db.prepare(`
 			UPDATE security_metadata 
 			SET recovery_email = ?,
@@ -1448,33 +2105,37 @@ function setupEmailSMSRecovery(email, phone, masterPassword) {
 				recovery_key_encrypted = ?,
 				recovery_key_salt = ?,
 				recovery_key_iv = ?,
-				master_password_backup_encrypted = ?,
-				master_password_backup_salt = ?,
-				master_password_backup_iv = ?,
+				master_password_backup_encrypted = NULL,
+				master_password_backup_salt = NULL,
+				master_password_backup_iv = NULL,
 				last_modified = CURRENT_TIMESTAMP
 			WHERE id = 1
 		`);
-		updateStmt.run(
-			email,
-			phone,
-			encryptedRecoveryKey,
-			recoveryKeySalt,
-			recoveryKeyIV,
-			encryptedMasterPasswordBackup,
-			masterPasswordBackupSalt,
-			masterPasswordBackupIV
-		);
+		updateStmt.run(email, phone, encryptedRecoveryKey, recoveryKeySalt, recoveryKeyIV);
 
-		console.log('[Vault] Email/SMS recovery set up successfully');
-		return true;
+		// IMPORTANT: Return recovery key ONCE to user - they must save it offline
+		// This is the ONLY time they'll see it
+		// Note: Recovery key doesn't preserve data - recovery = reset with data loss
+		const DEBUG_RECOVERY = process.env.DEBUG_RECOVERY === 'true' || process.env.NODE_ENV !== 'production';
+		if (DEBUG_RECOVERY) {
+			console.log('[Vault] Email/SMS recovery set up successfully');
+		}
+		return {
+			success: true,
+			recoveryKey: recoveryKey, // Show this ONCE, user must save it
+			warning:
+				'Save this recovery key securely offline. You will not see it again. Note: Recovery resets the vault with data loss - entries remain encrypted and inaccessible.',
+		};
 	} catch (error) {
-		console.error('[Vault] Error setting up email/SMS recovery:', error);
+		if (process.env.NODE_ENV !== 'production') {
+			console.error('[Vault] Error setting up email/SMS recovery:', error);
+		}
 		throw error;
 	}
 }
 
 // Generate and send recovery code
-function generateRecoveryCode(email, phone) {
+async function generateRecoveryCode(email, phone) {
 	try {
 		// Check if email/SMS recovery is set up
 		const checkStmt = db.prepare(`SELECT recovery_email, recovery_phone FROM security_metadata WHERE id = 1`);
@@ -1484,9 +2145,9 @@ function generateRecoveryCode(email, phone) {
 			throw new Error('Email/SMS recovery is not set up');
 		}
 
-		// Generate 6-digit code
-		const code = Math.floor(100000 + Math.random() * 900000).toString();
-		const codeHash = CryptoJS.SHA256(code).toString();
+		// Generate 6-digit code (100000-999999)
+		const code = crypto.randomInt(100000, 1000000).toString();
+		const codeHash = crypto.createHash('sha256').update(code).digest('hex');
 
 		// Store code hash with expiration (30 minutes - more reasonable time)
 		const expiresAt = new Date(Date.now() + 30 * 60 * 1000);
@@ -1496,36 +2157,67 @@ function generateRecoveryCode(email, phone) {
 		`);
 		insertStmt.run(codeHash, expiresAt.toISOString());
 
-		// In a real implementation, you would send this code via email/SMS
-		// For now, we'll just log it (in production, use a service like SendGrid, Twilio, etc.)
-		console.log('========================================');
-		console.log(`[Vault] ✅ Recovery code generated: ${code}`);
-		console.log(`[Vault] ⏰ Expires in: 30 minutes`);
-		console.log(`[Vault] 📧 Would send to email: ${result.recovery_email || 'N/A'}`);
-		console.log(`[Vault] 📱 Would send to phone: ${result.recovery_phone || 'N/A'}`);
-		console.log('========================================');
+		// SECURITY: Never log or return the code in production
+		const isDevelopment = process.env.NODE_ENV !== 'production' || process.env.DEV_RECOVERY_CODES === 'true';
 
-		// TODO: Integrate with email/SMS service
-		// For development, return the code so user can see it
-		// In production, return success without the code
-		return { success: true, code: code }; // Remove code in production!
+		if (isDevelopment) {
+			// Only in development - log for testing (behind feature flag)
+			console.log('[Vault] [DEV ONLY] Recovery code generated (expires in 30 minutes)');
+			console.log('[Vault] [DEV ONLY] Would send to:', result.recovery_email || result.recovery_phone);
+			// Return code only in dev
+			return { success: true, code: code };
+		} else {
+			// Production: Send via email/SMS service (implement integration)
+			// TODO: Integrate with SendGrid, Twilio, etc.
+			// sendRecoveryCodeViaEmail(result.recovery_email, code);
+			// sendRecoveryCodeViaSMS(result.recovery_phone, code);
+
+			// NEVER return or log the code in production
+			if (process.env.NODE_ENV !== 'production') {
+				console.log('[Vault] Recovery code generated and sent via email/SMS');
+			}
+			return { success: true }; // NO CODE in response
+		}
 	} catch (error) {
-		console.error('[Vault] Error generating recovery code:', error);
+		if (process.env.NODE_ENV !== 'production') {
+			console.error('[Vault] Error generating recovery code:', error);
+		}
 		throw error;
 	}
 }
 
 // Verify recovery code (doesn't mark as used - that happens during password reset)
-function verifyRecoveryCode(code) {
+async function verifyRecoveryCode(code) {
+	const DEBUG_RECOVERY = process.env.DEBUG_RECOVERY === 'true' || process.env.NODE_ENV !== 'production';
+
 	try {
 		if (!code || typeof code !== 'string' || code.length !== 6) {
-			console.error('[Vault] Invalid recovery code format:', code);
+			if (DEBUG_RECOVERY) {
+				console.error('[Vault] Invalid recovery code format');
+			}
 			return { verified: false, error: 'Invalid recovery code format' };
 		}
 
-		const codeHash = CryptoJS.SHA256(code).toString();
-		console.log('[Vault] Verifying recovery code, hash:', codeHash.substring(0, 8) + '...');
-		console.log('[Vault] Current time:', new Date().toISOString());
+		let codeHash;
+		if (cryptoWorkerRef) {
+			try {
+				const hashResult = await callWorkerCrypto('hashSHA256', {
+					text: code,
+				});
+				if (hashResult && hashResult.hash) {
+					codeHash = hashResult.hash;
+				} else {
+					throw new Error('Worker hashSHA256 returned no result');
+				}
+			} catch (error) {
+				if (DEBUG_RECOVERY) {
+					console.warn('[Vault] Worker hashSHA256 failed, using local crypto:', error.message);
+				}
+				codeHash = crypto.createHash('sha256').update(code).digest('hex');
+			}
+		} else {
+			codeHash = crypto.createHash('sha256').update(code).digest('hex');
+		}
 
 		// Check if code exists and is not expired or already used
 		const checkStmt = db.prepare(`
@@ -1535,64 +2227,66 @@ function verifyRecoveryCode(code) {
 		const result = checkStmt.get(codeHash);
 
 		if (!result) {
-			console.error('[Vault] Recovery code not found in database');
-			console.error('[Vault] Searched for hash:', codeHash.substring(0, 16) + '...');
-			// List all recovery codes for debugging
-			const allCodesStmt = db.prepare(
-				`SELECT id, code_hash, expires_at, used, created_at FROM recovery_codes ORDER BY created_at DESC LIMIT 5`
-			);
-			const allCodes = allCodesStmt.all();
-			console.log(
-				'[Vault] Recent recovery codes in database:',
-				allCodes.map(c => ({
-					id: c.id,
-					hash: c.code_hash.substring(0, 8) + '...',
-					expiresAt: c.expires_at,
-					used: c.used,
-				}))
-			);
+			if (DEBUG_RECOVERY) {
+				console.error('[Vault] Recovery code not found in database');
+			}
 			return { verified: false, error: 'Invalid recovery code' };
 		}
 
-		console.log('[Vault] Recovery code found:', {
-			id: result.id,
-			used: result.used,
-			expiresAt: result.expires_at,
-			createdAt: result.created_at,
-		});
-
 		// Check if already used
 		if (result.used === 1) {
-			console.error('[Vault] Recovery code already used');
-			console.error('[Vault] Code was used, cannot verify again');
+			if (DEBUG_RECOVERY) {
+				console.error('[Vault] Recovery code already used');
+			}
 			return { verified: false, error: 'This recovery code has already been used' };
 		}
 
 		// Check expiration
 		const expiresAt = new Date(result.expires_at);
 		const now = new Date();
-		console.log('[Vault] Expires at:', expiresAt.toISOString());
-		console.log('[Vault] Current time:', now.toISOString());
 		if (expiresAt < now) {
-			const minutesExpired = Math.floor((now - expiresAt) / 1000 / 60);
-			console.error('[Vault] Recovery code expired', minutesExpired, 'minutes ago');
+			if (DEBUG_RECOVERY) {
+				const minutesExpired = Math.floor((now - expiresAt) / 1000 / 60);
+				console.error('[Vault] Recovery code expired', minutesExpired, 'minutes ago');
+			}
 			return { verified: false, error: 'Recovery code has expired' };
 		}
 
-		console.log('[Vault] Recovery code verified successfully');
+		if (DEBUG_RECOVERY) {
+			console.log('[Vault] Recovery code verified successfully');
+		}
 		// Don't mark as used here - that will happen during password reset
 		// This allows the code to be verified multiple times before reset
 		return { verified: true, codeId: result.id };
 	} catch (error) {
-		console.error('[Vault] Error verifying recovery code:', error);
+		if (DEBUG_RECOVERY) {
+			console.error('[Vault] Error verifying recovery code:', error);
+		}
 		return { verified: false, error: 'Failed to verify recovery code: ' + error.message };
 	}
 }
 
 // Mark recovery code as used (called during password reset)
-function markRecoveryCodeAsUsed(code) {
+async function markRecoveryCodeAsUsed(code) {
 	try {
-		const codeHash = CryptoJS.SHA256(code).toString();
+		let codeHash;
+		if (cryptoWorkerRef) {
+			try {
+				const hashResult = await callWorkerCrypto('hashSHA256', {
+					text: code,
+				});
+				if (hashResult && hashResult.hash) {
+					codeHash = hashResult.hash;
+				} else {
+					throw new Error('Worker hashSHA256 returned no result');
+				}
+			} catch (error) {
+				console.warn('[Vault] Worker hashSHA256 failed, using local crypto:', error.message);
+				codeHash = crypto.createHash('sha256').update(code).digest('hex');
+			}
+		} else {
+			codeHash = crypto.createHash('sha256').update(code).digest('hex');
+		}
 		const markUsedStmt = db.prepare(
 			`UPDATE recovery_codes SET used = 1, used_at = CURRENT_TIMESTAMP WHERE code_hash = ? AND used = 0`
 		);
@@ -1607,262 +2301,234 @@ function markRecoveryCodeAsUsed(code) {
 	}
 }
 
-// Password Reset via Recovery (with data preservation for email/SMS)
-// This version decrypts all entries with the old password and re-encrypts with the new one
-function resetMasterPasswordViaRecovery(newPassword, recoveryMethod, recoveryData) {
+// Password Reset via Recovery
+// SIMPLIFIED: Recovery = reset with data loss (we don't store master password backup)
+// All recovery methods result in vault reset - entries remain encrypted and inaccessible
+async function resetMasterPasswordViaRecovery(newPassword, recoveryMethod, recoveryData) {
+	const DEBUG_RECOVERY = process.env.DEBUG_RECOVERY === 'true' || process.env.NODE_ENV !== 'production';
+
 	try {
 		// Validate new password
 		validateMasterPassword(newPassword);
 
 		// Verify recovery method
-		let verified = false;
-		let oldMasterPassword = null;
-		let recoveryData_db = null;
-
 		if (recoveryMethod === 'email_sms') {
-			// Verify recovery code (check if valid and not expired)
-			console.log('[Vault] ========== RESET PASSWORD VIA EMAIL/SMS RECOVERY ==========');
-			console.log(
-				'[Vault] Code received:',
-				recoveryData.code ? recoveryData.code.substring(0, 2) + '****' : 'UNDEFINED'
-			);
-			console.log('[Vault] Code length:', recoveryData.code?.length);
-			console.log('[Vault] Code type:', typeof recoveryData.code);
-
 			if (!recoveryData || !recoveryData.code) {
-				console.error('[Vault] No recovery code provided in recoveryData');
 				throw new Error('Recovery code is required');
 			}
 
 			if (typeof recoveryData.code !== 'string' || recoveryData.code.length !== 6) {
-				console.error('[Vault] Invalid recovery code format:', {
-					type: typeof recoveryData.code,
-					length: recoveryData.code.length,
-					code: recoveryData.code.substring(0, 2) + '****',
-				});
 				throw new Error('Invalid recovery code format. Code must be exactly 6 digits.');
 			}
 
-			console.log('[Vault] About to verify recovery code:', recoveryData.code.substring(0, 2) + '****');
-			let verifyResult;
-			try {
-				verifyResult = verifyRecoveryCode(recoveryData.code);
-				console.log('[Vault] Verification result:', JSON.stringify(verifyResult, null, 2));
-			} catch (verifyError) {
-				console.error('[Vault] Exception during verifyRecoveryCode:', verifyError);
-				throw new Error('Failed to verify recovery code: ' + (verifyError.message || 'Unknown error'));
+			if (DEBUG_RECOVERY) {
+				console.log('[Vault] Verifying recovery code...');
 			}
 
-			if (!verifyResult) {
-				console.error('[Vault] verifyRecoveryCode returned null/undefined');
-				throw new Error('Recovery code verification returned no result');
+			const verifyResult = await verifyRecoveryCode(recoveryData.code);
+			if (!verifyResult || !verifyResult.verified) {
+				throw new Error(verifyResult?.error || 'Recovery code verification failed');
 			}
 
-			if (!verifyResult.verified) {
-				const errorMsg = verifyResult.error || 'Recovery code verification failed';
-				console.error('[Vault] Recovery code verification failed');
-				console.error('[Vault] Error message:', errorMsg);
-				console.error('[Vault] Full verification result:', JSON.stringify(verifyResult, null, 2));
-				console.error('[Vault] Code that failed:', recoveryData.code);
-				throw new Error(errorMsg);
+			// Mark code as used
+			await markRecoveryCodeAsUsed(recoveryData.code);
+
+			// Verify recovery key if provided (optional - doesn't preserve data anyway)
+			if (recoveryData.recoveryKey) {
+				const recoveryStmt = db.prepare(`
+					SELECT recovery_email, recovery_phone, recovery_key_encrypted, recovery_key_salt, recovery_key_iv
+					FROM security_metadata WHERE id = 1
+				`);
+				const recoveryData_db = recoveryStmt.get();
+
+				if (recoveryData_db && recoveryData_db.recovery_key_encrypted) {
+					let recoveryKeyDerivation;
+					if (cryptoWorkerRef) {
+						try {
+							const hashResult = await callWorkerCrypto('hashSHA256', {
+								text: recoveryData_db.recovery_email + recoveryData_db.recovery_phone + 'recovery-salt-v1',
+							});
+							if (hashResult && hashResult.hash) {
+								recoveryKeyDerivation = hashResult.hash;
+							} else {
+								throw new Error('Worker hashSHA256 returned no result');
+							}
+						} catch (error) {
+							if (DEBUG_RECOVERY) {
+								console.warn('[Vault] Worker hashSHA256 failed, using local crypto:', error.message);
+							}
+							recoveryKeyDerivation = crypto
+								.createHash('sha256')
+								.update(recoveryData_db.recovery_email + recoveryData_db.recovery_phone + 'recovery-salt-v1')
+								.digest('hex');
+						}
+					} else {
+						recoveryKeyDerivation = crypto
+							.createHash('sha256')
+							.update(recoveryData_db.recovery_email + recoveryData_db.recovery_phone + 'recovery-salt-v1')
+							.digest('hex');
+					}
+					const decryptedRecoveryKey = await decrypt(
+						recoveryData_db.recovery_key_encrypted,
+						recoveryKeyDerivation,
+						recoveryData_db.recovery_key_salt,
+						recoveryData_db.recovery_key_iv,
+						null
+					);
+
+					if (!decryptedRecoveryKey || decryptedRecoveryKey !== recoveryData.recoveryKey) {
+						throw new Error('Invalid recovery key');
+					}
+				}
 			}
-
-			console.log('[Vault] ✅ Recovery code verified successfully!');
-
-			console.log('[Vault] Recovery code verified, marking as used');
-			// Mark code as used now that we're actually resetting the password
-			const marked = markRecoveryCodeAsUsed(recoveryData.code);
-			if (!marked) {
-				console.warn('[Vault] Failed to mark recovery code as used, but continuing with reset');
-			}
-
-			// Get recovery data from database
-			const recoveryStmt = db.prepare(`
-				SELECT recovery_email, recovery_phone, recovery_key_encrypted, recovery_key_salt, recovery_key_iv,
-					master_password_backup_encrypted, master_password_backup_salt, master_password_backup_iv
-				FROM security_metadata WHERE id = 1
-			`);
-			recoveryData_db = recoveryStmt.get();
-
-			if (!recoveryData_db || !recoveryData_db.master_password_backup_encrypted) {
-				throw new Error('Email/SMS recovery is not set up');
-			}
-
-			// Decrypt recovery key using email+phone
-			const recoveryKeyDerivation = CryptoJS.SHA256(
-				recoveryData_db.recovery_email + recoveryData_db.recovery_phone + 'recovery'
-			).toString();
-			const recoveryKey = decrypt(
-				recoveryData_db.recovery_key_encrypted,
-				recoveryKeyDerivation,
-				recoveryData_db.recovery_key_salt,
-				recoveryData_db.recovery_key_iv
-			);
-
-			// Decrypt master password backup
-			oldMasterPassword = decrypt(
-				recoveryData_db.master_password_backup_encrypted,
-				recoveryKey,
-				recoveryData_db.master_password_backup_salt,
-				recoveryData_db.master_password_backup_iv
-			);
-
-			if (!oldMasterPassword) {
-				throw new Error('Failed to decrypt master password backup');
-			}
-
-			verified = true;
 		} else if (recoveryMethod === 'backup_code') {
-			const verifyResult = verifyBackupCode(recoveryData.code);
+			const verifyResult = await verifyBackupCode(recoveryData.code);
 			if (!verifyResult.verified) {
 				throw new Error(verifyResult.error || 'Backup code verification failed');
 			}
-			// Backup codes don't give us the old password, so we can't preserve data
-			verified = true;
 		} else if (recoveryMethod === 'questions') {
-			const verifyResult = verifyRecoveryQuestions(recoveryData.answers);
+			const verifyResult = await verifyRecoveryQuestions(recoveryData.answers);
 			if (!verifyResult.verified) {
 				throw new Error(verifyResult.error || 'Recovery questions verification failed');
 			}
-			// Questions don't give us the old password either
-			verified = true;
 		} else {
 			throw new Error('Invalid recovery method');
 		}
 
-		if (!verified) {
-			throw new Error('Recovery verification failed');
+		// All recovery methods result in vault reset (data loss)
+		// We cannot decrypt entries without the old master password
+		const newSalt = await generateSalt();
+		let newHash;
+		if (cryptoWorkerRef) {
+			try {
+				const hashResult = await callWorkerCrypto('hashPBKDF2', {
+					password: newPassword,
+					salt: newSalt,
+				});
+				if (hashResult && hashResult.hash) {
+					newHash = hashResult.hash;
+				} else {
+					throw new Error('Worker hashPBKDF2 returned no result');
+				}
+			} catch (error) {
+				if (DEBUG_RECOVERY) {
+					console.warn('[Vault] Worker hashPBKDF2 failed, using local crypto:', error.message);
+				}
+				newHash = crypto
+					.pbkdf2Sync(newPassword, Buffer.from(newSalt, 'hex'), PBKDF2_ITERATIONS, KEY_LENGTH, 'sha256')
+					.toString('hex');
+			}
+		} else {
+			newHash = crypto
+				.pbkdf2Sync(newPassword, Buffer.from(newSalt, 'hex'), PBKDF2_ITERATIONS, KEY_LENGTH, 'sha256')
+				.toString('hex');
 		}
 
-		// If we have the old password (from email/SMS recovery), decrypt and re-encrypt all entries
-		if (oldMasterPassword) {
-			console.log('[Vault] Recovering password with data preservation...');
+		const updateHashStmt = db.prepare(`
+			UPDATE security_metadata 
+			SET master_password_hash = ?, password_salt = ?, last_modified = CURRENT_TIMESTAMP
+			WHERE id = 1
+		`);
+		updateHashStmt.run(newHash, newSalt);
 
-			// Get all entries
-			const stmt = db.prepare(`SELECT * FROM entries ORDER BY id`);
-			const rows = stmt.all();
-			console.log('[Vault] Found', rows.length, 'entries to re-encrypt');
+		// Clear recovery questions
+		const clearQuestionsStmt = db.prepare(`DELETE FROM recovery_questions`);
+		clearQuestionsStmt.run();
 
-			// Decrypt all entries with old password
-			const decryptableEntries = [];
-			for (const row of rows) {
-				try {
-					const plainPassword = decrypt(row.encrypted_password, oldMasterPassword, row.salt, row.iv);
-					if (plainPassword && plainPassword.length > 0) {
-						decryptableEntries.push({ ...row, plainPassword });
-					}
-				} catch (error) {
-					console.warn(`[Vault] Cannot decrypt entry ${row.id}:`, error.message);
-				}
+		// Invalidate all remaining backup codes
+		const invalidateCodesStmt = db.prepare(`UPDATE backup_codes SET used = 1 WHERE used = 0`);
+		invalidateCodesStmt.run();
+
+		if (DEBUG_RECOVERY) {
+			console.log('[Vault] Master password reset via recovery (data loss - entries remain encrypted)');
+		}
+
+		return {
+			success: true,
+			warning:
+				'Password reset successful. However, all password entries remain encrypted with your old password and cannot be accessed. You will need to delete and recreate them.',
+		};
+	} catch (error) {
+		if (DEBUG_RECOVERY) {
+			console.error('[Vault] Error resetting password via recovery:', error);
+		}
+		throw error;
+	}
+}
+
+// Batch migration from CBC to GCM format
+// Migrates all entries with enc_version='cbc' to 'gcm' format
+async function migrateEntriesToGCM(masterPassword) {
+	try {
+		if (!masterPassword) {
+			throw new Error('Master password is required');
+		}
+
+		// Get all CBC entries
+		const stmt = db.prepare(
+			`SELECT id, encrypted_password, salt, iv FROM entries WHERE enc_version = 'cbc' OR enc_version IS NULL`
+		);
+		const rows = stmt.all();
+
+		if (rows.length === 0) {
+			if (process.env.NODE_ENV !== 'production') {
+				console.log('[Vault] No entries to migrate');
 			}
+			return { migrated: 0, failed: 0 };
+		}
 
-			// Use transaction to re-encrypt all entries
-			const transaction = db.transaction(() => {
+		if (process.env.NODE_ENV !== 'production') {
+			console.log(`[Vault] Migrating ${rows.length} entries from CBC to GCM format...`);
+		}
+
+		const migrated = [];
+		const failed = [];
+
+		for (const row of rows) {
+			try {
+				// Decrypt using legacy CBC format
+				const decrypted = await decryptLegacy(row.encrypted_password, masterPassword, row.salt, row.iv, null);
+
+				if (!decrypted || decrypted.length === 0) {
+					failed.push({ id: row.id, reason: 'Decryption failed' });
+					continue;
+				}
+
+				// Re-encrypt with GCM format
+				const newSalt = await generateSalt();
+				const newIV = await generateIV();
+				const newEncrypted = await encrypt(decrypted, masterPassword, newSalt, newIV);
+
+				// Update entry
 				const updateStmt = db.prepare(`
 					UPDATE entries 
-					SET encrypted_password = ?, salt = ?, iv = ?, last_modified = CURRENT_TIMESTAMP
+					SET encrypted_password = ?, salt = ?, iv = ?, enc_version = 'gcm', last_modified = CURRENT_TIMESTAMP
 					WHERE id = ?
 				`);
+				updateStmt.run(newEncrypted, newSalt, newIV, row.id);
 
-				for (const entry of decryptableEntries) {
-					const newSalt = generateSalt();
-					const newIV = generateIV();
-					const newEncryptedPassword = encrypt(entry.plainPassword, newPassword, newSalt, newIV);
-					updateStmt.run(newEncryptedPassword, newSalt, newIV, entry.id);
+				migrated.push(row.id);
+			} catch (error) {
+				failed.push({ id: row.id, reason: error.message });
+				if (process.env.NODE_ENV !== 'production') {
+					console.error(`[Vault] Failed to migrate entry ${row.id}:`, error.message);
 				}
-
-				// Update master password hash
-				const newSalt = generateSalt();
-				const newHash = CryptoJS.PBKDF2(newPassword, newSalt, {
-					keySize: KEY_LENGTH / 4,
-					iterations: PBKDF2_ITERATIONS,
-				}).toString();
-
-				const updateHashStmt = db.prepare(`
-					UPDATE security_metadata 
-					SET master_password_hash = ?, password_salt = ?, last_modified = CURRENT_TIMESTAMP
-					WHERE id = 1
-				`);
-				updateHashStmt.run(newHash, newSalt);
-
-				// Update recovery backup with new password
-				const recoveryKey = generateSalt();
-				const recoveryKeySalt = generateSalt();
-				const recoveryKeyIV = generateIV();
-				const recoveryKeyDerivation = CryptoJS.SHA256(
-					recoveryData_db.recovery_email + recoveryData_db.recovery_phone + 'recovery'
-				).toString();
-				const encryptedRecoveryKey = encrypt(recoveryKey, recoveryKeyDerivation, recoveryKeySalt, recoveryKeyIV);
-
-				const masterPasswordBackupSalt = generateSalt();
-				const masterPasswordBackupIV = generateIV();
-				const encryptedMasterPasswordBackup = encrypt(
-					newPassword,
-					recoveryKey,
-					masterPasswordBackupSalt,
-					masterPasswordBackupIV
-				);
-
-				const updateRecoveryStmt = db.prepare(`
-					UPDATE security_metadata 
-					SET recovery_key_encrypted = ?,
-						recovery_key_salt = ?,
-						recovery_key_iv = ?,
-						master_password_backup_encrypted = ?,
-						master_password_backup_salt = ?,
-						master_password_backup_iv = ?
-					WHERE id = 1
-				`);
-				updateRecoveryStmt.run(
-					encryptedRecoveryKey,
-					recoveryKeySalt,
-					recoveryKeyIV,
-					encryptedMasterPasswordBackup,
-					masterPasswordBackupSalt,
-					masterPasswordBackupIV
-				);
-			});
-
-			transaction();
-
-			console.log('[Vault] Master password reset via email/SMS recovery - all data preserved');
-			return {
-				success: true,
-				message:
-					'Password reset successful. All your password entries have been preserved and are now accessible with your new password.',
-			};
-		} else {
-			// For backup codes and questions, we can't preserve data
-			const newSalt = generateSalt();
-			const newHash = CryptoJS.PBKDF2(newPassword, newSalt, {
-				keySize: KEY_LENGTH / 4,
-				iterations: PBKDF2_ITERATIONS,
-			}).toString();
-
-			const updateHashStmt = db.prepare(`
-				UPDATE security_metadata 
-				SET master_password_hash = ?, password_salt = ?, last_modified = CURRENT_TIMESTAMP
-				WHERE id = 1
-			`);
-			updateHashStmt.run(newHash, newSalt);
-
-			// Clear recovery questions
-			const clearQuestionsStmt = db.prepare(`DELETE FROM recovery_questions`);
-			clearQuestionsStmt.run();
-
-			// Invalidate all remaining backup codes
-			const invalidateCodesStmt = db.prepare(`UPDATE backup_codes SET used = 1 WHERE used = 0`);
-			invalidateCodesStmt.run();
-
-			console.log('[Vault] Master password reset via recovery (data not preserved)');
-			return {
-				success: true,
-				warning:
-					'Password reset successful. However, all password entries remain encrypted with your old password and cannot be accessed. You will need to delete and recreate them.',
-			};
+			}
 		}
+
+		if (process.env.NODE_ENV !== 'production') {
+			console.log(`[Vault] Migration complete: ${migrated.length} migrated, ${failed.length} failed`);
+		}
+
+		return {
+			migrated: migrated.length,
+			failed: failed.length,
+			failedEntries: failed,
+		};
 	} catch (error) {
-		console.error('[Vault] Error resetting password via recovery:', error);
+		if (process.env.NODE_ENV !== 'production') {
+			console.error('[Vault] Error in batch migration:', error);
+		}
 		throw error;
 	}
 }
@@ -1892,8 +2558,10 @@ module.exports = {
 	resetMasterPasswordViaRecovery,
 	getSecurityInfo,
 	diagnoseEntry,
+	setCryptoWorker, // Allow main.js to set worker reference
+	cleanupWorker, // Cleanup worker - reject all pending requests
 	cleanup: enhancedCleanup, // Use enhanced cleanup
-	secureClipboardCopy,
-	detectScreenCapture,
 	enhancedCleanup,
+	getEntryPassword, // Get password for single entry on demand
+	migrateEntriesToGCM, // Batch migration from CBC to GCM
 };
