@@ -28,6 +28,14 @@ setDatabasePath();
 
 const vault = require('./db/vault');
 
+// Set worker reference in vault for crypto operations
+// This allows vault.js to delegate crypto to worker thread
+function setVaultCryptoWorker() {
+	if (vaultWorker && vault.setCryptoWorker) {
+		vault.setCryptoWorker(vaultWorker);
+	}
+}
+
 // Security variables
 let autoLockTimer = null;
 let lastActivityTime = Date.now();
@@ -46,12 +54,24 @@ function createVaultWorker() {
 	});
 
 	vaultWorker.on('error', error => {
-		console.error('[Main] Worker error:', error);
+		if (process.env.NODE_ENV !== 'production') {
+			console.error('[Main] Worker error:', error);
+		}
+		// Cleanup pending requests on worker error
+		if (vault.cleanupWorker) {
+			vault.cleanupWorker();
+		}
 	});
 
 	vaultWorker.on('exit', code => {
 		if (code !== 0) {
-			console.error('[Main] Worker stopped with exit code:', code);
+			if (process.env.NODE_ENV !== 'production') {
+				console.error('[Main] Worker stopped with exit code:', code);
+			}
+		}
+		// Cleanup pending requests on worker exit
+		if (vault.cleanupWorker) {
+			vault.cleanupWorker();
 		}
 	});
 
@@ -60,6 +80,9 @@ function createVaultWorker() {
 		type: 'initialize',
 		id: 'init',
 	});
+
+	// Set worker reference in vault for crypto operations
+	setVaultCryptoWorker();
 }
 
 function handleWorkerMessage(message) {
@@ -116,6 +139,9 @@ function createWindow() {
 
 	// Initialize vault worker
 	createVaultWorker();
+	
+	// Set worker reference in vault for crypto operations
+	setVaultCryptoWorker();
 }
 
 // Security features that actually work
@@ -258,36 +284,13 @@ ipcMain.handle('vault:addEntry', async (event, entry) => {
 	}
 
 	try {
-		// Use worker thread for heavy operations
-		if (vaultWorker) {
-			return new Promise((resolve, reject) => {
-				const messageId = Date.now().toString();
-
-				const handler = message => {
-					if (message.id === messageId) {
-						vaultWorker.off('message', handler);
-						if (message.error) {
-							reject(new Error(message.error));
-						} else {
-							resolve(message.result);
-						}
-					}
-				};
-
-				vaultWorker.on('message', handler);
-				vaultWorker.postMessage({
-					type: 'addEntry',
-					id: messageId,
-					data: entry,
-				});
-			});
-		} else {
-			// Fallback to main thread if worker not available
-			const result = vault.addEntry(entry.name, entry.username, entry.password, entry.category, entry.masterPassword);
-			return result;
-		}
+		// Call vault.js directly - worker is used internally by vault.js for crypto operations only
+		const result = await vault.addEntry(entry.name, entry.username, entry.password, entry.category, entry.masterPassword);
+		return result;
 	} catch (error) {
-		console.error('[Main] Error in vault:addEntry:', error);
+		if (process.env.NODE_ENV !== 'production') {
+			console.error('[Main] Error in vault:addEntry:', error);
+		}
 		throw error;
 	}
 });
@@ -303,46 +306,48 @@ ipcMain.handle('vault:getEntries', async (event, masterPassword) => {
 	}
 
 	try {
-		// Use worker thread for heavy operations
-		if (vaultWorker) {
-			return new Promise((resolve, reject) => {
-				const messageId = Date.now().toString();
-
-				const handler = message => {
-					if (message.id === messageId) {
-						vaultWorker.off('message', handler);
-						if (message.error) {
-							reject(new Error(message.error));
-						} else {
-							resolve(message.result);
-						}
-					}
-				};
-
-				vaultWorker.on('message', handler);
-				vaultWorker.postMessage({
-					type: 'getEntries',
-					id: messageId,
-					data: masterPassword,
-				});
-			});
-		} else {
-			// Fallback to main thread if worker not available
-			const result = vault.getAllEntries(masterPassword);
-			return result;
-		}
+		// Call vault.js directly - worker is used internally by vault.js for crypto operations only
+		const result = await vault.getAllEntries();
+		return result;
 	} catch (error) {
-		console.error('[Main] Error in vault:getEntries:', error);
+		if (process.env.NODE_ENV !== 'production') {
+			console.error('[Main] Error in vault:getEntries:', error);
+		}
+		throw error;
+	}
+});
+
+ipcMain.handle('vault:getEntryPassword', async (event, data) => {
+	// Reset auto-lock timer on vault activity
+	if (autoLockTimer) {
+		clearTimeout(autoLockTimer);
+		lastActivityTime = Date.now();
+		autoLockTimer = setTimeout(() => {
+			event.sender.send('vault:autoLock');
+		}, AUTO_LOCK_DELAY);
+	}
+
+	try {
+		// Call vault.js directly - worker is used internally by vault.js for crypto operations only
+		const result = await vault.getEntryPassword(data.entryId, data.masterPassword);
+		return result;
+	} catch (error) {
+		if (process.env.NODE_ENV !== 'production') {
+			console.error('[Main] Error in vault:getEntryPassword:', error);
+		}
 		throw error;
 	}
 });
 
 ipcMain.handle('vault:diagnoseEntry', async (event, data) => {
 	try {
-		const result = vault.diagnoseEntry(data.entryId, data.masterPassword);
+		// Call vault.js directly - worker is used internally by vault.js for crypto operations only
+		const result = await vault.diagnoseEntry(data.entryId, data.masterPassword);
 		return result;
 	} catch (error) {
-		console.error('[Main] Error in vault:diagnoseEntry:', error);
+		if (process.env.NODE_ENV !== 'production') {
+			console.error('[Main] Error in vault:diagnoseEntry:', error);
+		}
 		throw error;
 	}
 });
@@ -358,36 +363,13 @@ ipcMain.handle('vault:changeMasterPassword', async (event, data) => {
 	}
 
 	try {
-		// Use worker thread for heavy operations
-		if (vaultWorker) {
-			return new Promise((resolve, reject) => {
-				const messageId = Date.now().toString();
-
-				const handler = message => {
-					if (message.id === messageId) {
-						vaultWorker.off('message', handler);
-						if (message.error) {
-							reject(new Error(message.error));
-						} else {
-							resolve(message.result);
-						}
-					}
-				};
-
-				vaultWorker.on('message', handler);
-				vaultWorker.postMessage({
-					type: 'changeMasterPassword',
-					id: messageId,
-					data: data,
-				});
-			});
-		} else {
-			// Fallback to main thread if worker not available
-			const result = vault.changeMasterPassword(data.oldPassword, data.newPassword);
-			return result;
-		}
+		// Call vault.js directly - worker is used internally by vault.js for crypto operations only
+		const result = await vault.changeMasterPassword(data.oldPassword, data.newPassword);
+		return result;
 	} catch (error) {
-		console.error('[Main] Error in vault:changeMasterPassword:', error);
+		if (process.env.NODE_ENV !== 'production') {
+			console.error('[Main] Error in vault:changeMasterPassword:', error);
+		}
 		throw error;
 	}
 });
@@ -403,43 +385,20 @@ ipcMain.handle('vault:updateEntry', async (event, entry) => {
 	}
 
 	try {
-		// Use worker thread for heavy operations
-		if (vaultWorker) {
-			return new Promise((resolve, reject) => {
-				const messageId = Date.now().toString();
-
-				const handler = message => {
-					if (message.id === messageId) {
-						vaultWorker.off('message', handler);
-						if (message.error) {
-							reject(new Error(message.error));
-						} else {
-							resolve(message.result);
-						}
-					}
-				};
-
-				vaultWorker.on('message', handler);
-				vaultWorker.postMessage({
-					type: 'updateEntry',
-					id: messageId,
-					data: entry,
-				});
-			});
-		} else {
-			// Fallback to main thread if worker not available
-			const result = vault.updateEntry(
-				entry.id,
-				entry.name,
-				entry.username,
-				entry.password,
-				entry.category,
-				entry.masterPassword
-			);
-			return result;
-		}
+		// Call vault.js directly - worker is used internally by vault.js for crypto operations only
+		const result = await vault.updateEntry(
+			entry.id,
+			entry.name,
+			entry.username,
+			entry.password,
+			entry.category,
+			entry.masterPassword
+		);
+		return result;
 	} catch (error) {
-		console.error('[Main] Error in vault:updateEntry:', error);
+		if (process.env.NODE_ENV !== 'production') {
+			console.error('[Main] Error in vault:updateEntry:', error);
+		}
 		throw error;
 	}
 });
@@ -455,36 +414,13 @@ ipcMain.handle('vault:getEntryHistory', async (event, data) => {
 	}
 
 	try {
-		// Use worker thread for heavy operations
-		if (vaultWorker) {
-			return new Promise((resolve, reject) => {
-				const messageId = Date.now().toString();
-
-				const handler = message => {
-					if (message.id === messageId) {
-						vaultWorker.off('message', handler);
-						if (message.error) {
-							reject(new Error(message.error));
-						} else {
-							resolve(message.result);
-						}
-					}
-				};
-
-				vaultWorker.on('message', handler);
-				vaultWorker.postMessage({
-					type: 'getEntryHistory',
-					id: messageId,
-					data: data,
-				});
-			});
-		} else {
-			// Fallback to main thread if worker not available
-			const result = vault.getEntryHistory(data.entryId, data.masterPassword);
-			return result;
-		}
+		// Call vault.js directly - worker is used internally by vault.js for crypto operations only
+		const result = await vault.getEntryHistory(data.entryId, data.masterPassword);
+		return result;
 	} catch (error) {
-		console.error('[Main] Error in vault:getEntryHistory:', error);
+		if (process.env.NODE_ENV !== 'production') {
+			console.error('[Main] Error in vault:getEntryHistory:', error);
+		}
 		throw error;
 	}
 });
@@ -500,36 +436,13 @@ ipcMain.handle('vault:rollbackEntry', async (event, data) => {
 	}
 
 	try {
-		// Use worker thread for heavy operations
-		if (vaultWorker) {
-			return new Promise((resolve, reject) => {
-				const messageId = Date.now().toString();
-
-				const handler = message => {
-					if (message.id === messageId) {
-						vaultWorker.off('message', handler);
-						if (message.error) {
-							reject(new Error(message.error));
-						} else {
-							resolve(message.result);
-						}
-					}
-				};
-
-				vaultWorker.on('message', handler);
-				vaultWorker.postMessage({
-					type: 'rollbackEntry',
-					id: messageId,
-					data: data,
-				});
-			});
-		} else {
-			// Fallback to main thread if worker not available
-			const result = vault.rollbackEntry(data.entryId, data.historyId, data.masterPassword);
-			return result;
-		}
+		// Call vault.js directly - worker is used internally by vault.js for crypto operations only
+		const result = await vault.rollbackEntry(data.entryId, data.historyId, data.masterPassword);
+		return result;
 	} catch (error) {
-		console.error('[Main] Error in vault:rollbackEntry:', error);
+		if (process.env.NODE_ENV !== 'production') {
+			console.error('[Main] Error in vault:rollbackEntry:', error);
+		}
 		throw error;
 	}
 });
@@ -553,443 +466,158 @@ ipcMain.handle('vault:deleteEntry', (event, id) => {
 	}
 });
 
-ipcMain.handle('vault:testMasterPassword', (event, masterPassword) => {
+ipcMain.handle('vault:testMasterPassword', async (event, masterPassword) => {
 	try {
-		if (vaultWorker) {
-			return new Promise((resolve, reject) => {
-				const messageId = Date.now().toString();
-
-				const handler = message => {
-					if (message.id === messageId) {
-						vaultWorker.off('message', handler);
-						if (message.error) {
-							reject(new Error(message.error));
-						} else {
-							resolve(message.result);
-						}
-					}
-				};
-
-				vaultWorker.on('message', handler);
-				vaultWorker.postMessage({
-					type: 'testMasterPassword',
-					id: messageId,
-					data: masterPassword,
-				});
-			});
-		} else {
-			return vault.testMasterPassword(masterPassword);
-		}
+		// Call vault.js directly - worker is used internally by vault.js for crypto operations only
+		return await vault.testMasterPassword(masterPassword);
 	} catch (error) {
-		console.error('[Main] Error in vault:testMasterPassword:', error);
+		if (process.env.NODE_ENV !== 'production') {
+			console.error('[Main] Error in vault:testMasterPassword:', error);
+		}
 		throw error;
 	}
 });
 
 ipcMain.handle('vault:setPasswordHint', async (event, data) => {
 	try {
-		if (vaultWorker) {
-			return new Promise((resolve, reject) => {
-				const messageId = Date.now().toString();
-
-				const handler = message => {
-					if (message.id === messageId) {
-						vaultWorker.off('message', handler);
-						if (message.error) {
-							reject(new Error(message.error));
-						} else {
-							resolve(message.result);
-						}
-					}
-				};
-
-				vaultWorker.on('message', handler);
-				vaultWorker.postMessage({
-					type: 'setPasswordHint',
-					id: messageId,
-					data: data,
-				});
-			});
-		} else {
-			return vault.setPasswordHint(data.hint, data.masterPassword);
-		}
+		// Call vault.js directly - worker is used internally by vault.js for crypto operations only
+		return await vault.setPasswordHint(data.hint, data.masterPassword);
 	} catch (error) {
-		console.error('[Main] Error in vault:setPasswordHint:', error);
+		if (process.env.NODE_ENV !== 'production') {
+			console.error('[Main] Error in vault:setPasswordHint:', error);
+		}
 		throw error;
 	}
 });
 
 ipcMain.handle('vault:getPasswordHint', async (event, masterPassword) => {
 	try {
-		if (vaultWorker) {
-			return new Promise((resolve, reject) => {
-				const messageId = Date.now().toString();
-
-				const handler = message => {
-					if (message.id === messageId) {
-						vaultWorker.off('message', handler);
-						if (message.error) {
-							reject(new Error(message.error));
-						} else {
-							resolve(message.result);
-						}
-					}
-				};
-
-				vaultWorker.on('message', handler);
-				vaultWorker.postMessage({
-					type: 'getPasswordHint',
-					id: messageId,
-					data: masterPassword,
-				});
-			});
-		} else {
-			return vault.getPasswordHint(masterPassword);
-		}
+		// Call vault.js directly - worker is used internally by vault.js for crypto operations only
+		return await vault.getPasswordHint(masterPassword);
 	} catch (error) {
-		console.error('[Main] Error in vault:getPasswordHint:', error);
+		if (process.env.NODE_ENV !== 'production') {
+			console.error('[Main] Error in vault:getPasswordHint:', error);
+		}
 		throw error;
 	}
 });
 
 ipcMain.handle('vault:setRecoveryQuestions', async (event, data) => {
 	try {
-		if (vaultWorker) {
-			return new Promise((resolve, reject) => {
-				const messageId = Date.now().toString();
-
-				const handler = message => {
-					if (message.id === messageId) {
-						vaultWorker.off('message', handler);
-						if (message.error) {
-							reject(new Error(message.error));
-						} else {
-							resolve(message.result);
-						}
-					}
-				};
-
-				vaultWorker.on('message', handler);
-				vaultWorker.postMessage({
-					type: 'setRecoveryQuestions',
-					id: messageId,
-					data: data,
-				});
-			});
-		} else {
-			return vault.setRecoveryQuestions(data.questions, data.masterPassword);
-		}
+		// Call vault.js directly - worker is used internally by vault.js for crypto operations only
+		return await vault.setRecoveryQuestions(data.questions, data.masterPassword);
 	} catch (error) {
-		console.error('[Main] Error in vault:setRecoveryQuestions:', error);
+		if (process.env.NODE_ENV !== 'production') {
+			console.error('[Main] Error in vault:setRecoveryQuestions:', error);
+		}
 		throw error;
 	}
 });
 
 ipcMain.handle('vault:verifyRecoveryQuestions', async (event, answers) => {
 	try {
-		if (vaultWorker) {
-			return new Promise((resolve, reject) => {
-				const messageId = Date.now().toString();
-
-				const handler = message => {
-					if (message.id === messageId) {
-						vaultWorker.off('message', handler);
-						if (message.error) {
-							reject(new Error(message.error));
-						} else {
-							resolve(message.result);
-						}
-					}
-				};
-
-				vaultWorker.on('message', handler);
-				vaultWorker.postMessage({
-					type: 'verifyRecoveryQuestions',
-					id: messageId,
-					data: { answers },
-				});
-			});
-		} else {
-			return vault.verifyRecoveryQuestions(answers);
-		}
+		// Call vault.js directly - worker is used internally by vault.js for crypto operations only
+		return await vault.verifyRecoveryQuestions(answers);
 	} catch (error) {
-		console.error('[Main] Error in vault:verifyRecoveryQuestions:', error);
+		if (process.env.NODE_ENV !== 'production') {
+			console.error('[Main] Error in vault:verifyRecoveryQuestions:', error);
+		}
 		throw error;
 	}
 });
 
 ipcMain.handle('vault:getRecoveryQuestions', async (event) => {
 	try {
-		if (vaultWorker) {
-			return new Promise((resolve, reject) => {
-				const messageId = Date.now().toString();
-
-				const handler = message => {
-					if (message.id === messageId) {
-						vaultWorker.off('message', handler);
-						if (message.error) {
-							reject(new Error(message.error));
-						} else {
-							resolve(message.result);
-						}
-					}
-				};
-
-				vaultWorker.on('message', handler);
-				vaultWorker.postMessage({
-					type: 'getRecoveryQuestions',
-					id: messageId,
-					data: null,
-				});
-			});
-		} else {
-			return vault.getRecoveryQuestions();
-		}
+		// Call vault.js directly - worker is used internally by vault.js for crypto operations only
+		return await vault.getRecoveryQuestions();
 	} catch (error) {
-		console.error('[Main] Error in vault:getRecoveryQuestions:', error);
+		if (process.env.NODE_ENV !== 'production') {
+			console.error('[Main] Error in vault:getRecoveryQuestions:', error);
+		}
 		throw error;
 	}
 });
 
 ipcMain.handle('vault:generateBackupCodes', async (event, masterPassword) => {
 	try {
-		if (vaultWorker) {
-			return new Promise((resolve, reject) => {
-				const messageId = Date.now().toString();
-
-				const handler = message => {
-					if (message.id === messageId) {
-						vaultWorker.off('message', handler);
-						if (message.error) {
-							reject(new Error(message.error));
-						} else {
-							resolve(message.result);
-						}
-					}
-				};
-
-				vaultWorker.on('message', handler);
-				vaultWorker.postMessage({
-					type: 'generateBackupCodes',
-					id: messageId,
-					data: masterPassword,
-				});
-			});
-		} else {
-			return vault.generateBackupCodes(masterPassword);
-		}
+		// Call vault.js directly - worker is used internally by vault.js for crypto operations only
+		return await vault.generateBackupCodes(masterPassword);
 	} catch (error) {
-		console.error('[Main] Error in vault:generateBackupCodes:', error);
+		if (process.env.NODE_ENV !== 'production') {
+			console.error('[Main] Error in vault:generateBackupCodes:', error);
+		}
 		throw error;
 	}
 });
 
 ipcMain.handle('vault:verifyBackupCode', async (event, code) => {
 	try {
-		if (vaultWorker) {
-			return new Promise((resolve, reject) => {
-				const messageId = Date.now().toString();
-
-				const handler = message => {
-					if (message.id === messageId) {
-						vaultWorker.off('message', handler);
-						if (message.error) {
-							reject(new Error(message.error));
-						} else {
-							resolve(message.result);
-						}
-					}
-				};
-
-				vaultWorker.on('message', handler);
-				vaultWorker.postMessage({
-					type: 'verifyBackupCode',
-					id: messageId,
-					data: code,
-				});
-			});
-		} else {
-			return vault.verifyBackupCode(code);
-		}
+		// Call vault.js directly - worker is used internally by vault.js for crypto operations only
+		return await vault.verifyBackupCode(code);
 	} catch (error) {
-		console.error('[Main] Error in vault:verifyBackupCode:', error);
+		if (process.env.NODE_ENV !== 'production') {
+			console.error('[Main] Error in vault:verifyBackupCode:', error);
+		}
 		throw error;
 	}
 });
 
 ipcMain.handle('vault:getBackupCodesStatus', async (event) => {
 	try {
-		if (vaultWorker) {
-			return new Promise((resolve, reject) => {
-				const messageId = Date.now().toString();
-
-				const handler = message => {
-					if (message.id === messageId) {
-						vaultWorker.off('message', handler);
-						if (message.error) {
-							reject(new Error(message.error));
-						} else {
-							resolve(message.result);
-						}
-					}
-				};
-
-				vaultWorker.on('message', handler);
-				vaultWorker.postMessage({
-					type: 'getBackupCodesStatus',
-					id: messageId,
-					data: null,
-				});
-			});
-		} else {
-			return vault.getBackupCodesStatus();
-		}
+		// Call vault.js directly - worker is used internally by vault.js for crypto operations only
+		return await vault.getBackupCodesStatus();
 	} catch (error) {
-		console.error('[Main] Error in vault:getBackupCodesStatus:', error);
+		if (process.env.NODE_ENV !== 'production') {
+			console.error('[Main] Error in vault:getBackupCodesStatus:', error);
+		}
 		throw error;
 	}
 });
 
 ipcMain.handle('vault:setupEmailSMSRecovery', async (event, data) => {
 	try {
-		if (vaultWorker) {
-			return new Promise((resolve, reject) => {
-				const messageId = Date.now().toString();
-
-				const handler = message => {
-					if (message.id === messageId) {
-						vaultWorker.off('message', handler);
-						if (message.error) {
-							reject(new Error(message.error));
-						} else {
-							resolve(message.result);
-						}
-					}
-				};
-
-				vaultWorker.on('message', handler);
-
-				vaultWorker.postMessage({
-					type: 'setupEmailSMSRecovery',
-					id: messageId,
-					data: {
-						email: data.email,
-						phone: data.phone,
-						masterPassword: data.masterPassword,
-					},
-				});
-			});
-		} else {
-			throw new Error('Vault worker not initialized');
-		}
+		// Call vault.js directly - worker is used internally by vault.js for crypto operations only
+		return await vault.setupEmailSMSRecovery(data.email, data.phone, data.masterPassword);
 	} catch (error) {
-		console.error('[Main] Error in vault:setupEmailSMSRecovery:', error);
+		if (process.env.NODE_ENV !== 'production') {
+			console.error('[Main] Error in vault:setupEmailSMSRecovery:', error);
+		}
 		throw error;
 	}
 });
 
 ipcMain.handle('vault:generateRecoveryCode', async (event, data) => {
 	try {
-		if (vaultWorker) {
-			return new Promise((resolve, reject) => {
-				const messageId = Date.now().toString();
-
-				const handler = message => {
-					if (message.id === messageId) {
-						vaultWorker.off('message', handler);
-						if (message.error) {
-							reject(new Error(message.error));
-						} else {
-							resolve(message.result);
-						}
-					}
-				};
-
-				vaultWorker.on('message', handler);
-
-				vaultWorker.postMessage({
-					type: 'generateRecoveryCode',
-					id: messageId,
-					data: {
-						email: data.email,
-						phone: data.phone,
-					},
-				});
-			});
-		} else {
-			throw new Error('Vault worker not initialized');
-		}
+		// Call vault.js directly - worker is used internally by vault.js for crypto operations only
+		return await vault.generateRecoveryCode(data.email, data.phone);
 	} catch (error) {
-		console.error('[Main] Error in vault:generateRecoveryCode:', error);
+		if (process.env.NODE_ENV !== 'production') {
+			console.error('[Main] Error in vault:generateRecoveryCode:', error);
+		}
 		throw error;
 	}
 });
 
 ipcMain.handle('vault:verifyRecoveryCode', async (event, data) => {
 	try {
-		if (vaultWorker) {
-			return new Promise((resolve, reject) => {
-				const messageId = Date.now().toString();
-
-				const handler = message => {
-					if (message.id === messageId) {
-						vaultWorker.off('message', handler);
-						if (message.error) {
-							reject(new Error(message.error));
-						} else {
-							resolve(message.result);
-						}
-					}
-				};
-
-				vaultWorker.on('message', handler);
-
-				vaultWorker.postMessage({
-					type: 'verifyRecoveryCode',
-					id: messageId,
-					data: {
-						code: data.code,
-					},
-				});
-			});
-		} else {
-			throw new Error('Vault worker not initialized');
-		}
+		// Call vault.js directly - worker is used internally by vault.js for crypto operations only
+		return await vault.verifyRecoveryCode(data.code);
 	} catch (error) {
-		console.error('[Main] Error in vault:verifyRecoveryCode:', error);
+		if (process.env.NODE_ENV !== 'production') {
+			console.error('[Main] Error in vault:verifyRecoveryCode:', error);
+		}
 		throw error;
 	}
 });
 
 ipcMain.handle('vault:resetMasterPasswordViaRecovery', async (event, data) => {
 	try {
-		if (vaultWorker) {
-			return new Promise((resolve, reject) => {
-				const messageId = Date.now().toString();
-
-				const handler = message => {
-					if (message.id === messageId) {
-						vaultWorker.off('message', handler);
-						if (message.error) {
-							reject(new Error(message.error));
-						} else {
-							resolve(message.result);
-						}
-					}
-				};
-
-				vaultWorker.on('message', handler);
-				vaultWorker.postMessage({
-					type: 'resetMasterPasswordViaRecovery',
-					id: messageId,
-					data: data,
-				});
-			});
-		} else {
-			return vault.resetMasterPasswordViaRecovery(data.newPassword, data.recoveryMethod, data.recoveryData);
-		}
+		// Call vault.js directly - worker is used internally by vault.js for crypto operations only
+		return await vault.resetMasterPasswordViaRecovery(data.newPassword, data.recoveryMethod, data.recoveryData);
 	} catch (error) {
-		console.error('[Main] Error in vault:resetMasterPasswordViaRecovery:', error);
+		if (process.env.NODE_ENV !== 'production') {
+			console.error('[Main] Error in vault:resetMasterPasswordViaRecovery:', error);
+		}
 		throw error;
 	}
 });

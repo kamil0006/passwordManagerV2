@@ -4,6 +4,7 @@ const { contextBridge, ipcRenderer } = require('electron');
 contextBridge.exposeInMainWorld('vault', {
 	addEntry: entry => ipcRenderer.invoke('vault:addEntry', entry),
 	getEntries: masterPassword => ipcRenderer.invoke('vault:getEntries', masterPassword),
+	getEntryPassword: (entryId, masterPassword) => ipcRenderer.invoke('vault:getEntryPassword', { entryId, masterPassword }),
 	updateEntry: entry => ipcRenderer.invoke('vault:updateEntry', entry),
 	deleteEntry: id => ipcRenderer.invoke('vault:deleteEntry', id),
 	getEntryHistory: (entryId, masterPassword) => ipcRenderer.invoke('vault:getEntryHistory', { entryId, masterPassword }),
