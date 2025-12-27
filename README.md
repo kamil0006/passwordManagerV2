@@ -1,5 +1,7 @@
 # Password Manager
 
+> ⚠️ **Status: Work in Progress** - This application is currently under active development and is not yet feature-complete. Some features may be incomplete or subject to change.
+
 Offline-first password manager built with Electron + React. Data is stored locally in SQLite with per-entry encryption.
 
 ## Features
@@ -13,87 +15,175 @@ Offline-first password manager built with Electron + React. Data is stored local
 - Auto-lock on inactivity
 - Dark/light theme
 
-## Security model (high level)
+## Security Model
 
-- Data at rest is encrypted per entry using AES-256-GCM; the database stores ciphertext + per-entry salt/IV/authTag.
-- Master password is verified via a stored hash; encryption keys are derived from the master password using PBKDF2.
-- App is designed for local/offline usage; no cloud sync is built in.
-- Renderer is isolated via Electron preload/IPC (context isolation enabled).
-- Cryptographic operations are performed in a dedicated worker thread for better isolation.
+### Encryption Algorithm
 
-### Memory Security
+**AES-256-GCM (Galois/Counter Mode)**
 
-**Important**: JavaScript's garbage collector does **not** guarantee secure memory wiping. When the code sets sensitive variables to `null` (e.g., `password = null`), this is a "best effort" attempt to minimize the lifetime of sensitive data in memory, but it does **not** provide cryptographic-grade secure memory erasure. For production deployments requiring strict memory security, consider:
+- **Algorithm**: AES-256 (256-bit key)
+- **Mode**: GCM (authenticated encryption)
+- **IV Length**: 12 bytes (96 bits) - recommended size for GCM
+- **Authentication Tag**: 16 bytes (128 bits)
+- **Additional Authenticated Data (AAD)**: `'password-manager-vault'` (context binding)
 
-- Using native modules with explicit memory clearing
-- Running in a secure enclave or TEE (Trusted Execution Environment)
-- Implementing application-level memory protection policies
+**Key Derivation: PBKDF2**
 
-The current implementation minimizes sensitive data lifetime by:
+- **Function**: PBKDF2 with SHA-256
+- **Iterations**: 100,000 (configurable via `PBKDF2_ITERATIONS`)
+- **Salt Length**: 32 bytes (256 bits) - unique per entry
+- **Key Length**: 32 bytes (256 bits)
 
-- Clearing password references immediately after use
-- Performing cryptographic operations in an isolated worker thread
-- Avoiding logging of sensitive data
+**Storage Format:**
 
-Notes:
+- Each entry encrypted separately with unique salt and IV
+- Database stores: `encrypted_password` (format: `encrypted:authTag`), `salt`, `iv`, `enc_version`
+- Database file itself is **not encrypted** (SQLite plaintext), but all sensitive data inside is encrypted per-entry
 
-- "DevTools blocking" and "context menu blocking" are UX hardening and do **not** replace OS-level security.
-- Legacy CBC-encrypted entries are automatically migrated to GCM format on access.
+### Versioning
 
-## Security Changes & Migration
+**Encryption Version Tracking:**
 
-### Migration: CBC → GCM (v2.0)
+- `enc_version = 'gcm'`: New entries (v2.0+) - AES-256-GCM
+- `enc_version = 'cbc'` or `null`: Legacy entries (v1.0) - AES-256-CBC
+- Version stored per-entry in database `enc_version` column
 
-The application has been upgraded from AES-256-CBC to **AES-256-GCM** encryption for improved security:
+**Application Versions:**
 
-**Why GCM?**
+- **v1.0**: Initial release with AES-256-CBC encryption
+- **v2.0**: Upgraded to AES-256-GCM with automatic migration
 
-- **Authenticated Encryption**: GCM provides both confidentiality and authenticity, preventing tampering with encrypted data
-- **Security**: CBC mode is vulnerable to padding oracle attacks and doesn't provide integrity verification
-- **Industry Standard**: GCM is the recommended mode for modern applications
+### Architecture
 
-**What Changed:**
+- **Local/Offline**: No cloud sync, all data stored locally in SQLite
+- **Renderer Isolation**: Electron preload/IPC with context isolation enabled
+- **Worker Thread**: All cryptographic operations performed in dedicated `vault-worker.js` thread
+- **On-Demand Decryption**: Passwords fetched via `getEntryPassword()` API, not returned in `getAllEntries()`
 
-- All new entries are encrypted using AES-256-GCM with authentication tags
-- Legacy CBC-encrypted entries are automatically migrated to GCM on first access
-- Database schema includes `enc_version` column to track encryption format per entry
-- Batch migration function available for migrating all legacy entries at once
+### Migration: CBC → GCM
 
-**Migration Process:**
+**Automatic Migration:**
 
-- Automatic: Legacy entries are detected and re-encrypted when accessed
-- Transparent: Users don't need to take any action
-- Safe: Original data is preserved in entry history before migration
-- Batch: `migrateEntriesToGCM()` function available for bulk migration
+- Legacy entries (`enc_version = 'cbc'` or `null`) are automatically detected and re-encrypted to GCM when accessed
+- Migration happens transparently during `decrypt()` → `decryptLegacy()` → re-encrypt with GCM
+- Original encrypted data preserved in entry history before migration
+- New salt and IV generated during migration (prevents correlation attacks)
+
+**Batch Migration:**
+
+- `migrateEntriesToGCM(masterPassword)` function available for bulk migration
+- Migrates all entries with `enc_version = 'cbc'` or `NULL` to `'gcm'`
+- Returns `{ migrated: count, failed: [{ id, reason }] }`
 
 **Backward Compatibility:**
 
-- Old CBC-encrypted entries continue to work during transition period
-- Migration happens automatically without data loss
-- Entry history preserves original encrypted format for rollback capability
+- Legacy CBC entries continue to work during transition
+- CryptoJS used for legacy decryption (backward compatibility)
+- Entry history preserves original encrypted format for rollback
+
+### Limitations & Security Considerations
+
+**Memory Security:**
+JavaScript's garbage collector does **not** guarantee secure memory wiping. Setting variables to `null` (e.g., `password = null`) is a "best effort" attempt to minimize sensitive data lifetime, but does **not** provide cryptographic-grade secure memory erasure.
+
+**What This Means:**
+
+- Passwords may remain in memory after use until GC runs
+- Memory dumps (core dumps, hibernation files) may contain plaintext passwords
+- For strict memory security, consider:
+  - Native modules with explicit memory clearing (`Buffer.fill(0)`)
+  - Secure enclaves or TEE (Trusted Execution Environment)
+  - Application-level memory protection policies
+
+**Current Mitigations:**
+
+- Password references cleared immediately after use (`password = null`)
+- Cryptographic operations isolated in worker thread
+- No sensitive data in logs (production mode)
+- Key buffers explicitly zeroed where possible (`key.fill(0)`)
+
+**Database Security:**
+
+- **Database file is NOT encrypted** - SQLite file is plaintext
+- **Data inside is encrypted** - each entry encrypted separately
+- **Metadata visible**: Entry names, usernames, categories, timestamps are stored in plaintext
+- **Structure visible**: Table schema, entry IDs, access counts visible to anyone with file access
+
+**Threat Model:**
+
+**Protected Against:**
+
+- ✅ Unauthorized data access without master password (strong encryption)
+- ✅ Data tampering (GCM authentication tag verification)
+- ✅ Brute force attacks (PBKDF2 with 100k iterations, account lockout)
+- ✅ Rainbow table attacks (per-entry unique salts)
+- ✅ Replay attacks (unique IVs per encryption)
+- ✅ Padding oracle attacks (GCM mode, not CBC)
+
+**NOT Protected Against:**
+
+- ❌ Physical access to database file (can see structure, metadata, encrypted data)
+- ❌ Memory dumps / hibernation files (may contain plaintext passwords)
+- ❌ Keyloggers (master password can be captured)
+- ❌ Screen capture (only UI-level detection, not prevention)
+- ❌ Clipboard monitoring (passwords copied to clipboard)
+- ❌ Malware with process memory access
+- ❌ OS-level compromise (root/admin access)
+
+**UX Hardening (Not Real Security):**
+
+- DevTools blocking: Can be bypassed, only deters casual inspection
+- Context menu blocking: Can be bypassed, only deters casual inspection
+- Screen capture detection: Only alerts, doesn't prevent capture
+- These features are **UX hardening**, not cryptographic security
+
+## Security Changes & Migration (v2.0)
+
+### Summary
+
+The application was upgraded from **AES-256-CBC** to **AES-256-GCM** encryption in v2.0. See the [Security Model](#security-model) section above for detailed technical specifications.
+
+**Key Changes:**
+
+- ✅ Migrated to authenticated encryption (GCM) with integrity verification
+- ✅ Automatic migration of legacy CBC entries on access
+- ✅ Explicit version tracking (`enc_version` column per entry)
+- ✅ All cryptographic operations isolated in worker thread
+- ✅ On-demand password fetching (no bulk password exposure)
+
+**Why GCM?**
+
+- Authenticated encryption prevents tampering
+- No padding oracle vulnerabilities (unlike CBC)
+- Industry standard for modern applications
+- Automatic integrity verification via authentication tags
 
 ### Security Improvements (v2.0)
 
 **Cryptography:**
 
-- Unified encryption to Node.js `crypto` (removed CryptoJS dependency for new data)
-- All cryptographic operations delegated to isolated worker thread
-- Consistent PBKDF2 key derivation with configurable iterations
-- Per-entry unique salts and IVs for enhanced security
+- Migrated from AES-256-CBC to AES-256-GCM (authenticated encryption)
+- Unified to Node.js `crypto` module (CryptoJS only for legacy CBC decryption)
+- All cryptographic operations delegated to isolated worker thread (`vault-worker.js`)
+- Consistent PBKDF2 key derivation: 100,000 iterations, SHA-256, 32-byte keys
+- Per-entry unique salts (32 bytes) and IVs (12 bytes for GCM)
+- Explicit `enc_version` tracking per entry in database
 
 **Data Protection:**
 
-- Passwords no longer returned in `getAllEntries()` - fetched on-demand via `getEntryPassword()`
-- Reduced sensitive data lifetime in main thread
-- Production logging restrictions (no sensitive data in logs)
-- Enhanced error handling for corrupted GCM data (prevents silent fallback to legacy)
+- Passwords no longer returned in `getAllEntries()` - fetched on-demand via `getEntryPassword(entryId, masterPassword)`
+- Reduced sensitive data lifetime in main thread (worker isolation)
+- Production logging restrictions (`NODE_ENV !== 'production'` - no sensitive data in logs)
+- Enhanced error handling: corrupted GCM data returns `null` immediately (no silent fallback to legacy)
+- GCM format validation: `encrypted:authTag` format strictly enforced
 
 **Code Quality:**
 
-- Removed unused imports and dead code
-- Improved error messages for debugging
-- Better handling of database schema migrations
-- Worker isolation verified
+- Removed unused imports (`path`, `fs` from worker)
+- Removed dead code (`AUTH_TAG_LENGTH`, `sensitiveData` variables)
+- Improved error messages for debugging (format errors, migration failures)
+- Robust database schema migration with `try/catch` fallbacks
+- Worker isolation verified (no `require('./vault')` in worker)
 
 ## How to Run
 
