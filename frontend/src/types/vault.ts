@@ -51,6 +51,7 @@ declare global {
 				masterPassword: string;
 			}) => Promise<void>;
 			getEntries: (masterPassword: string) => Promise<Entry[]>;
+			getEntryPassword: (entryId: number, masterPassword: string) => Promise<string>;
 			updateEntry: (entry: {
 				id: number;
 				name: string;

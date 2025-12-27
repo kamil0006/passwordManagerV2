@@ -327,19 +327,34 @@ const VaultScreen: React.FC<Props> = ({ masterPassword, onAutoLock }) => {
 		setEntryToDelete(null);
 	};
 
-	const handleEditClick = (entry: Entry) => {
+	const handleEditClick = async (entry: Entry) => {
 		setEntryToEdit(entry);
-		setEditForm({
-			name: entry.name,
-			username: entry.username || '',
-			password: entry.password,
-			category: entry.category || 'personal',
-		});
-		setEditCategoryManuallySelected(false);
-		// Analyze password strength for the existing password
-		const strength = analyzePasswordStrength(entry.password);
-		setEditPasswordStrength(strength);
-		setShowEditModal(true);
+
+		// Get password on demand (entries from getAllEntries don't include passwords)
+		try {
+			let password = '';
+			if (window.vault && typeof window.vault.getEntryPassword === 'function') {
+				password = await window.vault.getEntryPassword(entry.id, masterPassword);
+			} else {
+				// Fallback: try to get from entry if available (legacy support)
+				password = entry.password || '';
+			}
+
+			setEditForm({
+				name: entry.name,
+				username: entry.username || '',
+				password: password,
+				category: entry.category || 'personal',
+			});
+			setEditCategoryManuallySelected(false);
+			// Analyze password strength for the existing password
+			const strength = analyzePasswordStrength(password);
+			setEditPasswordStrength(strength);
+			setShowEditModal(true);
+		} catch (error) {
+			console.error('[VaultScreen] Error getting password for edit:', error);
+			alert(`Failed to load password for editing: ${error instanceof Error ? error.message : 'Unknown error'}`);
+		}
 	};
 
 	const handleHistoryClick = async (entry: Entry) => {
@@ -479,11 +494,17 @@ const VaultScreen: React.FC<Props> = ({ masterPassword, onAutoLock }) => {
 
 			for (const entry of entriesToUpdate) {
 				try {
+					// Get password on demand (entries don't include passwords)
+					let password = '';
+					if (window.vault && typeof window.vault.getEntryPassword === 'function') {
+						password = await window.vault.getEntryPassword(entry.id, masterPassword);
+					}
+
 					const success = await window.vault.updateEntry({
 						id: entry.id,
 						name: entry.name,
 						username: entry.username || '',
-						password: entry.password, // Keep existing password
+						password: password, // Keep existing password
 						category: bulkEditForm.category,
 						masterPassword,
 					});
@@ -2352,7 +2373,22 @@ const VaultScreen: React.FC<Props> = ({ masterPassword, onAutoLock }) => {
 											<div className='entry-password'>
 												<span className='password-mask'>••••••••</span>
 												<button
-													onClick={() => copyToClipboard(entry.password, 'Password', `password-${entry.id}`)}
+													onClick={async () => {
+														try {
+															// Get password on demand (entries don't include passwords)
+															if (window.vault && typeof window.vault.getEntryPassword === 'function') {
+																const password = await window.vault.getEntryPassword(entry.id, masterPassword);
+																await copyToClipboard(password, 'Password', `password-${entry.id}`);
+															} else {
+																alert('Password retrieval not available. Please restart the app.');
+															}
+														} catch (error) {
+															console.error('[VaultScreen] Error getting password for copy:', error);
+															alert(
+																`Failed to get password: ${error instanceof Error ? error.message : 'Unknown error'}`
+															);
+														}
+													}}
 													className='copy-button'
 													title='Copy password'>
 													{copiedItem === `password-${entry.id}` ? <Check size={16} /> : <Copy size={16} />}
