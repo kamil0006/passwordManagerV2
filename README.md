@@ -30,11 +30,13 @@ Offline-first password manager built with Electron + React. Data is stored local
 - Implementing application-level memory protection policies
 
 The current implementation minimizes sensitive data lifetime by:
+
 - Clearing password references immediately after use
 - Performing cryptographic operations in an isolated worker thread
 - Avoiding logging of sensitive data
 
 Notes:
+
 - "DevTools blocking" and "context menu blocking" are UX hardening and do **not** replace OS-level security.
 - Legacy CBC-encrypted entries are automatically migrated to GCM format on access.
 
@@ -45,23 +47,27 @@ Notes:
 The application has been upgraded from AES-256-CBC to **AES-256-GCM** encryption for improved security:
 
 **Why GCM?**
+
 - **Authenticated Encryption**: GCM provides both confidentiality and authenticity, preventing tampering with encrypted data
 - **Security**: CBC mode is vulnerable to padding oracle attacks and doesn't provide integrity verification
 - **Industry Standard**: GCM is the recommended mode for modern applications
 
 **What Changed:**
+
 - All new entries are encrypted using AES-256-GCM with authentication tags
 - Legacy CBC-encrypted entries are automatically migrated to GCM on first access
 - Database schema includes `enc_version` column to track encryption format per entry
 - Batch migration function available for migrating all legacy entries at once
 
 **Migration Process:**
+
 - Automatic: Legacy entries are detected and re-encrypted when accessed
 - Transparent: Users don't need to take any action
 - Safe: Original data is preserved in entry history before migration
 - Batch: `migrateEntriesToGCM()` function available for bulk migration
 
 **Backward Compatibility:**
+
 - Old CBC-encrypted entries continue to work during transition period
 - Migration happens automatically without data loss
 - Entry history preserves original encrypted format for rollback capability
@@ -69,18 +75,21 @@ The application has been upgraded from AES-256-CBC to **AES-256-GCM** encryption
 ### Security Improvements (v2.0)
 
 **Cryptography:**
+
 - Unified encryption to Node.js `crypto` (removed CryptoJS dependency for new data)
 - All cryptographic operations delegated to isolated worker thread
 - Consistent PBKDF2 key derivation with configurable iterations
 - Per-entry unique salts and IVs for enhanced security
 
 **Data Protection:**
+
 - Passwords no longer returned in `getAllEntries()` - fetched on-demand via `getEntryPassword()`
 - Reduced sensitive data lifetime in main thread
 - Production logging restrictions (no sensitive data in logs)
 - Enhanced error handling for corrupted GCM data (prevents silent fallback to legacy)
 
 **Code Quality:**
+
 - Removed unused imports and dead code
 - Improved error messages for debugging
 - Better handling of database schema migrations
@@ -90,18 +99,20 @@ The application has been upgraded from AES-256-CBC to **AES-256-GCM** encryption
 
 ### Prerequisites
 
-- Node.js 18+ 
+- Node.js 18+
 - npm or yarn
 
 ### Installation
 
 1. Clone the repository:
+
 ```bash
 git clone <repository-url>
 cd passwordManager
 ```
 
 2. Install dependencies:
+
 ```bash
 npm install
 cd frontend
@@ -110,17 +121,20 @@ cd ..
 ```
 
 3. (Optional) Configure environment variables:
+
 ```bash
 cp .env.example .env
 # Edit .env if needed (usually not required for development)
 ```
 
 4. Start the development server:
+
 ```bash
 npm run dev
 ```
 
 This will:
+
 - Start the Vite dev server for the frontend (usually on http://localhost:5173)
 - Launch the Electron app automatically
 
