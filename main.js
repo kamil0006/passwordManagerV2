@@ -105,8 +105,8 @@ function handleWorkerMessage(message) {
 
 function createWindow() {
 	const win = new BrowserWindow({
-		width: 1280,
-		height: 800,
+		width: 1920,
+		height: 1080,
 		minWidth: 600,
 		minHeight: 400,
 		webPreferences: {

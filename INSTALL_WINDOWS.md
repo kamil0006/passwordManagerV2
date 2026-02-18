@@ -1,78 +1,82 @@
-# Instalacja na Windows
+# Windows Installation
 
-## Wymagania
+## Requirements
 
-- **Node.js** 18+ (zalecane LTS) – [nodejs.org](https://nodejs.org)
-- **Visual Studio Build Tools** (dla `better-sqlite3`) – [Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) – wybierz „Desktop development with C++”
+- **Node.js** 18+ (LTS recommended) – [nodejs.org](https://nodejs.org)
+- **Visual Studio Build Tools** (for `better-sqlite3`) – [Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) – select "Desktop development with C++"
 
-## Kroki instalacji (dla użytkownika końcowego)
+## Installation Steps (for end users)
 
-1. Pobierz plik instalatora z folderu `electron-builder-output/`:
-   - **NSIS** (instalator): `Password Manager Setup 1.0.0.exe`
-   - **Portable**: `Password Manager 1.0.0.exe` (bez instalacji)
+1. Download the installer from the `electron-builder-output/` folder:
+   - **NSIS** (installer): `Password Manager Setup 1.0.0.exe`
+   - **Portable**: `Password Manager 1.0.0.exe` (no installation required)
 
-2. Uruchom plik `.exe` i postępuj według instrukcji.
+2. Run the `.exe` file and follow the instructions.
 
-3. Po instalacji aplikacja będzie dostępna w menu Start i na pulpicie.
+3. After installation, the app will be available in the Start menu and on the desktop.
 
 ---
 
-## Budowanie instalatora (dla developera)
+## Building the Installer (for developers)
 
-### 1. Zainstaluj zależności
+### 1. Install dependencies
 
 ```powershell
 cd c:\Users\Kamil\passwordManager
 npm install
 ```
 
-### 2. Zbuduj frontend i utwórz instalator
+### 2. Build frontend and create installer
 
 ```powershell
 npm run build
 ```
 
-To polecenie:
-- buduje frontend (Vite → `frontend/dist/`)
-- pakuje aplikację Electron
-- tworzy instalator NSIS i wersję portable w `electron-builder-output/`
+This command:
+- builds the frontend (Vite → `frontend/dist/`)
+- packages the Electron app
+- creates the NSIS installer and portable version in `electron-builder-output/`
 
-### 3. Wynik
+### 3. Output
 
-W folderze `electron-builder-output/` znajdziesz:
+In the `electron-builder-output/` folder you will find:
 
-| Plik | Opis |
-|------|------|
-| `Password Manager Setup 1.0.0.exe` | Instalator NSIS (zalecany do dystrybucji) |
-| `Password Manager 1.0.0.exe` | Wersja portable (bez instalacji) |
+| File | Description |
+|------|-------------|
+| `Password Manager Setup 1.0.0.exe` | NSIS installer (recommended for distribution) |
+| `Password Manager 1.0.0.exe` | Portable version (no installation) |
 
-### Szybki test (bez instalatora)
+### Quick test (without installer)
 
 ```powershell
 npm run build:dir
 ```
 
-Tworzy rozpakowaną aplikację w `electron-builder-output/win-unpacked/`. Uruchom `Password Manager.exe` z tego folderu.
+Creates an unpacked app in `electron-builder-output/win-unpacked/`. Run `Password Manager.exe` from that folder.
 
 ---
 
-## Rozwiązywanie problemów
+## Troubleshooting
 
-### Błąd: „node-gyp” / „MSBuild”
+### Error: "node-gyp" / "MSBuild"
 
-Zainstaluj Visual Studio Build Tools z komponentem „Desktop development with C++”.
+Install Visual Studio Build Tools with the "Desktop development with C++" component.
 
-### Błąd: „better-sqlite3” nie buduje się
+### Error: "better-sqlite3" fails to build
 
 ```powershell
 npx electron-rebuild -f -w better-sqlite3
 ```
 
-### Błąd: „Cannot create symbolic link” (winCodeSign)
+### Error: "Cannot create symbolic link" (winCodeSign)
 
-Na Windows bez uprawnień administratora może wystąpić błąd przy rozpakowywaniu winCodeSign. W `package.json` jest ustawione `signAndEditExecutable: false`, co omija ten problem. Alternatywnie uruchom terminal jako Administrator.
+On Windows without administrator privileges, an error may occur when extracting winCodeSign. The `package.json` has `signAndEditExecutable: false` set to work around this. The app icon (in the window, on the taskbar) is still applied via the `afterPack` hook.
 
-### Baza danych po instalacji
+### App icon
 
-Dane są zapisywane w:
-`%APPDATA%\passwordmanager\` (lub w katalogu `userData` aplikacji Electron).
+The icon is located at `build/icon.png` (min. 256×256 px). The `afterPack` hook embeds it in the exe (installer, portable, app window) instead of the Electron logo.
+
+### Database after installation
+
+Data is stored in:
+`%APPDATA%\passwordmanager\` (or in the Electron app's `userData` directory).

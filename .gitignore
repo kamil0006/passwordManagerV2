@@ -40,6 +40,8 @@ lerna-debug.log*
 # ============================================
 dist/
 build/
+!build/icon.png
+!build/afterPack.js
 out/
 *.tsbuildinfo
 .next/
