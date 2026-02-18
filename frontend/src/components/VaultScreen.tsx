@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import './VaultScreen.css';
 import type { Entry, EntryHistory } from '../types/vault';
 import {
@@ -16,7 +16,11 @@ import {
 	Search,
 	Shuffle,
 	Edit2,
+	ExternalLink,
+	FileText,
+	ArrowUpDown,
 	Lock,
+	LogOut,
 	History,
 	RotateCcw,
 	Menu,
@@ -26,6 +30,8 @@ import {
 	Moon,
 	CheckCircle,
 	AlertTriangle,
+	HardDrive,
+	Upload,
 } from 'lucide-react';
 import { useTheme } from '../contexts/ThemeContext';
 import PasswordGeneratorModal from './PasswordGeneratorModal';
@@ -40,20 +46,23 @@ type Props = {
 const VaultScreen: React.FC<Props> = ({ masterPassword, onAutoLock }) => {
 	const { theme, toggleTheme } = useTheme();
 	const [entries, setEntries] = useState<Entry[]>([]);
-	const [form, setForm] = useState({ name: '', username: '', password: '', category: 'personal' });
+	const [form, setForm] = useState({ name: '', username: '', password: '', category: 'personal', url: '', notes: '' });
 	const [isLoading, setIsLoading] = useState(false);
 	const [isAdding, setIsAdding] = useState(false);
 	const [timeUntilLock, setTimeUntilLock] = useState(180); // 3 minutes
 	const [copiedItem, setCopiedItem] = useState<string | null>(null); // Track what was copied
 	const [searchQuery, setSearchQuery] = useState(''); // Search functionality
 	const [selectedCategory, setSelectedCategory] = useState('all'); // Category filter
+	const [sortBy, setSortBy] = useState<'name' | 'date' | 'category'>('date');
+	const [sortOrder, setSortOrder] = useState<'asc' | 'desc'>('desc');
+	const [showSortModal, setShowSortModal] = useState(false);
 	const [showCategoryModal, setShowCategoryModal] = useState(false); // Category selection modal
 	const [showFilterModal, setShowFilterModal] = useState(false); // Category filter modal
 	const [showDeleteModal, setShowDeleteModal] = useState(false); // Delete confirmation modal
 	const [entryToDelete, setEntryToDelete] = useState<number | null>(null); // Entry ID to delete
 	const [showEditModal, setShowEditModal] = useState(false); // Edit modal
 	const [entryToEdit, setEntryToEdit] = useState<Entry | null>(null); // Entry being edited
-	const [editForm, setEditForm] = useState({ name: '', username: '', password: '', category: 'personal' }); // Edit form state
+	const [editForm, setEditForm] = useState({ name: '', username: '', password: '', category: 'personal', url: '', notes: '' }); // Edit form state
 	const [isEditing, setIsEditing] = useState(false); // Editing in progress
 	const [editCategoryManuallySelected, setEditCategoryManuallySelected] = useState(false); // Track if user manually selected category in edit form
 	const [editPasswordStrength, setEditPasswordStrength] = useState<PasswordStrength | null>(null); // Password strength for edit form
@@ -65,7 +74,6 @@ const VaultScreen: React.FC<Props> = ({ masterPassword, onAutoLock }) => {
 		currentPassword: '',
 		newPassword: '',
 		confirmPassword: '',
-		passwordHint: '',
 	}); // Change password form state
 	const [isChangingPassword, setIsChangingPassword] = useState(false); // Changing password in progress
 	const [newPasswordStrength, setNewPasswordStrength] = useState<PasswordStrength | null>(null); // New password strength
@@ -82,21 +90,72 @@ const VaultScreen: React.FC<Props> = ({ masterPassword, onAutoLock }) => {
 	const [isBulkEditing, setIsBulkEditing] = useState(false); // Bulk edit in progress
 	const [bulkEditForm, setBulkEditForm] = useState({ category: 'personal' }); // Bulk edit form (only category for now)
 	const [showRecoverySettings, setShowRecoverySettings] = useState(false); // Recovery settings modal
-	const [recoveryQuestions, setRecoveryQuestions] = useState<Array<{ question: string; answer: string }>>([
-		{ question: '', answer: '' },
-	]); // Recovery questions form
-	const [isSavingRecoveryQuestions, setIsSavingRecoveryQuestions] = useState(false); // Saving recovery questions
-	const [backupCodesStatus, setBackupCodesStatus] = useState({ total: 0, unused: 0, used: 0 }); // Backup codes status
-	const [generatedBackupCodes, setGeneratedBackupCodes] = useState<string[]>([]); // Generated backup codes to display
-	const [isGeneratingCodes, setIsGeneratingCodes] = useState(false); // Generating backup codes
-	const [_existingRecoveryQuestions, setExistingRecoveryQuestions] = useState<
-		Array<{ number: number; question: string }>
-	>([]); // Existing recovery questions (set in loadRecoverySettings, kept for potential future use)
 	const [emailSMSRecovery, setEmailSMSRecovery] = useState({ email: '', phone: '' }); // Email/SMS recovery setup
 	const [isSettingUpEmailSMS, setIsSettingUpEmailSMS] = useState(false); // Setting up email/SMS recovery
 	const [showMenu, setShowMenu] = useState(false); // Burger menu open/close
 	const [showSecurityInfo, setShowSecurityInfo] = useState(false); // Security info modal
 	const [securityStatus, setSecurityStatus] = useState<any>(null); // Security status for modal
+	const [isExportingBackup, setIsExportingBackup] = useState(false); // Export backup in progress
+	const [isRestoringBackup, setIsRestoringBackup] = useState(false); // Restore backup in progress
+	const [showNotesModal, setShowNotesModal] = useState(false); // Notes modal
+	const [entryForNotes, setEntryForNotes] = useState<Entry | null>(null); // Entry whose notes we're viewing
+	const searchInputRef = useRef<HTMLInputElement>(null);
+	const addFormServiceRef = useRef<HTMLInputElement>(null);
+
+	// Keyboard shortcuts: Ctrl+F (search), Ctrl+N (new entry), Ctrl+L (lock)
+	useEffect(() => {
+		const handleKeyDown = (e: KeyboardEvent) => {
+			if (!(e.ctrlKey || e.metaKey)) return;
+			const modalOpen =
+				showEditModal ||
+				showDeleteModal ||
+				showNotesModal ||
+				showFilterModal ||
+				showSortModal ||
+				showCategoryModal ||
+				showPasswordGenerator ||
+				showBulkDeleteModal ||
+				showBulkEditModal ||
+				showChangePasswordModal ||
+				showHistoryModal ||
+				showRecoverySettings ||
+				showSecurityInfo;
+			if (e.key === 'l' || e.key === 'L') {
+				e.preventDefault();
+				onAutoLock();
+				return;
+			}
+			if (modalOpen) return;
+			if (e.key === 'f' || e.key === 'F') {
+				e.preventDefault();
+				searchInputRef.current?.focus();
+				return;
+			}
+			if (e.key === 'n' || e.key === 'N') {
+				e.preventDefault();
+				addFormServiceRef.current?.focus();
+				addFormServiceRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+				return;
+			}
+		};
+		window.addEventListener('keydown', handleKeyDown);
+		return () => window.removeEventListener('keydown', handleKeyDown);
+	}, [
+		onAutoLock,
+		showEditModal,
+		showDeleteModal,
+		showNotesModal,
+		showFilterModal,
+		showSortModal,
+		showCategoryModal,
+		showPasswordGenerator,
+		showBulkDeleteModal,
+		showBulkEditModal,
+		showChangePasswordModal,
+		showHistoryModal,
+		showRecoverySettings,
+		showSecurityInfo,
+	]);
 
 	// Helper function to render category icon
 	const renderCategoryIcon = (iconName: string, size: number = 16) => {
@@ -250,7 +309,7 @@ const VaultScreen: React.FC<Props> = ({ masterPassword, onAutoLock }) => {
 	}, []);
 
 	const resetForm = () => {
-		setForm({ name: '', username: '', password: '', category: 'personal' });
+		setForm({ name: '', username: '', password: '', category: 'personal', url: '', notes: '' });
 		setCategoryManuallySelected(false);
 	};
 
@@ -273,6 +332,8 @@ const VaultScreen: React.FC<Props> = ({ masterPassword, onAutoLock }) => {
 				username: form.username,
 				password: form.password,
 				category: form.category,
+				url: form.url,
+				notes: form.notes,
 				masterPassword,
 			});
 			resetForm();
@@ -345,6 +406,8 @@ const VaultScreen: React.FC<Props> = ({ masterPassword, onAutoLock }) => {
 				username: entry.username || '',
 				password: password,
 				category: entry.category || 'personal',
+				url: entry.url || '',
+				notes: entry.notes || '',
 			});
 			setEditCategoryManuallySelected(false);
 			// Analyze password strength for the existing password
@@ -408,7 +471,7 @@ const VaultScreen: React.FC<Props> = ({ masterPassword, onAutoLock }) => {
 		if (selectedEntries.size === filteredEntries.length) {
 			setSelectedEntries(new Set());
 		} else {
-			setSelectedEntries(new Set(filteredEntries.map(e => e.id)));
+			setSelectedEntries(new Set(sortedEntries.map(e => e.id)));
 		}
 	};
 
@@ -506,6 +569,8 @@ const VaultScreen: React.FC<Props> = ({ masterPassword, onAutoLock }) => {
 						username: entry.username || '',
 						password: password, // Keep existing password
 						category: bulkEditForm.category,
+						url: entry.url || '',
+						notes: entry.notes || '',
 						masterPassword,
 					});
 					if (success) {
@@ -546,7 +611,7 @@ const VaultScreen: React.FC<Props> = ({ masterPassword, onAutoLock }) => {
 
 		if (
 			!confirm(
-				`Are you sure you want to rollback this entry to this previous version? The current version will be saved to history.`
+				`Are you sure you want to rollback this entry to this previous version? The current version will be saved to history.`,
 			)
 		) {
 			return;
@@ -588,7 +653,7 @@ const VaultScreen: React.FC<Props> = ({ masterPassword, onAutoLock }) => {
 	const handleEditCancel = () => {
 		setShowEditModal(false);
 		setEntryToEdit(null);
-		setEditForm({ name: '', username: '', password: '', category: 'personal' });
+		setEditForm({ name: '', username: '', password: '', category: 'personal', url: '', notes: '' });
 		setEditPasswordStrength(null);
 		setEditCategoryManuallySelected(false);
 	};
@@ -621,6 +686,8 @@ const VaultScreen: React.FC<Props> = ({ masterPassword, onAutoLock }) => {
 				username: editForm.username,
 				password: editForm.password,
 				category: editForm.category,
+				url: editForm.url,
+				notes: editForm.notes,
 				masterPassword,
 			});
 
@@ -709,23 +776,6 @@ const VaultScreen: React.FC<Props> = ({ masterPassword, onAutoLock }) => {
 			});
 
 			if (result) {
-				// Save password hint if provided
-				if (changePasswordForm.passwordHint.trim() && typeof window.vault.setPasswordHint === 'function') {
-					try {
-						await window.vault.setPasswordHint(changePasswordForm.passwordHint.trim(), changePasswordForm.newPassword);
-					} catch (error) {
-						console.error('[VaultScreen] Error setting password hint:', error);
-						// Don't fail the password change if hint fails
-					}
-				} else if (!changePasswordForm.passwordHint.trim() && typeof window.vault.setPasswordHint === 'function') {
-					// Clear hint if empty
-					try {
-						await window.vault.setPasswordHint('', changePasswordForm.newPassword);
-					} catch (error) {
-						console.error('[VaultScreen] Error clearing password hint:', error);
-					}
-				}
-
 				let message = 'Master password changed successfully!';
 
 				// Check if some entries were skipped (result is an object with details)
@@ -734,22 +784,17 @@ const VaultScreen: React.FC<Props> = ({ masterPassword, onAutoLock }) => {
 						const skippedDetails = result.skippedEntries
 							.map(
 								(e: { id: number; name: string; reason?: string }) =>
-									`ID ${e.id} (${e.name})${e.reason ? ': ' + e.reason : ''}`
+									`ID ${e.id} (${e.name})${e.reason ? ': ' + e.reason : ''}`,
 							)
 							.join('\n');
 						message += `\n\nWarning: ${result.skipped} entry/entries could not be decrypted and were skipped:\n${skippedDetails}\n\nThese entries will remain encrypted with the old password. You may need to delete and recreate them, or they may be corrupted.`;
 					}
 				}
 
-				if (changePasswordForm.passwordHint.trim()) {
-					message += '\n\nPassword hint has been saved.';
-				}
-
 				message += '\n\nYou will need to log in again with your new password.';
 
 				alert(message);
-				// Reset form and close modal
-				setChangePasswordForm({ currentPassword: '', newPassword: '', confirmPassword: '', passwordHint: '' });
+				setChangePasswordForm({ currentPassword: '', newPassword: '', confirmPassword: '' });
 				setNewPasswordStrength(null);
 				setShowChangePasswordModal(false);
 				// Trigger auto-lock to force re-login
@@ -781,97 +826,64 @@ const VaultScreen: React.FC<Props> = ({ masterPassword, onAutoLock }) => {
 	const loadRecoverySettings = async () => {
 		try {
 			if (!window.vault) return;
-
-			// Load existing recovery questions
-			if (typeof window.vault.getRecoveryQuestions === 'function') {
-				const questions = await window.vault.getRecoveryQuestions();
-				setExistingRecoveryQuestions(questions); // Store for reference
-				if (questions.length > 0) {
-					setRecoveryQuestions(questions.map(q => ({ question: q.question, answer: '' })));
-				}
-			}
-
-			// Load backup codes status
-			if (typeof window.vault.getBackupCodesStatus === 'function') {
-				const status = await window.vault.getBackupCodesStatus();
-				setBackupCodesStatus(status);
-			}
 		} catch (error) {
 			console.error('[VaultScreen] Error loading recovery settings:', error);
 		}
 	};
 
-	// Handle save recovery questions
-	const handleSaveRecoveryQuestions = async () => {
-		// Validate
-		const validQuestions = recoveryQuestions.filter(q => q.question.trim() && q.answer.trim());
-		if (validQuestions.length === 0) {
-			alert('Please add at least one recovery question with both question and answer');
+	// Vault backup - export database to file
+	const handleExportBackup = async () => {
+		if (typeof window.vault.exportBackup !== 'function') {
+			alert('Backup feature not available. Please restart the app to apply updates.');
 			return;
 		}
-
-		if (validQuestions.length > 5) {
-			alert('Maximum 5 recovery questions allowed');
-			return;
-		}
-
+		setIsExportingBackup(true);
 		try {
-			if (!window.vault) {
-				console.error('[VaultScreen] window.vault is undefined!');
-				alert('Vault API not available. Please restart the app.');
+			const result = await window.vault.exportBackup();
+			if (result.canceled) {
 				return;
 			}
-
-			// Check if function exists
-			if (typeof window.vault.setRecoveryQuestions !== 'function') {
-				console.error('[VaultScreen] setRecoveryQuestions is not a function!');
-				alert('Recovery questions feature not available. Please restart the app to apply updates.');
-				return;
+			if (result.success && result.path) {
+				alert(`Backup saved successfully to:\n${result.path}`);
 			}
-
-			setIsSavingRecoveryQuestions(true);
-			await window.vault.setRecoveryQuestions(validQuestions, masterPassword);
-			alert(`Successfully saved ${validQuestions.length} recovery question${validQuestions.length === 1 ? '' : 's'}`);
-			await loadRecoverySettings();
 		} catch (error) {
-			console.error('[VaultScreen] Error saving recovery questions:', error);
+			console.error('[VaultScreen] Error exporting backup:', error);
 			const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-			alert(`Failed to save recovery questions: ${errorMessage}`);
+			alert(`Failed to export backup: ${errorMessage}`);
 		} finally {
-			setIsSavingRecoveryQuestions(false);
+			setIsExportingBackup(false);
 		}
 	};
 
-	// Handle generate backup codes
-	const handleGenerateBackupCodes = async () => {
-		if (!confirm('Generating new backup codes will invalidate all existing unused codes. Continue?')) {
+	// Vault restore - replace database with backup file (app will restart)
+	const handleRestoreBackup = async () => {
+		if (
+			!confirm(
+				'Restore from backup?\n\nThis will replace ALL current data with the backup. The app will restart. Continue?',
+			)
+		) {
 			return;
 		}
-
+		if (typeof window.vault.restoreBackup !== 'function') {
+			alert('Restore feature not available. Please restart the app to apply updates.');
+			return;
+		}
+		setIsRestoringBackup(true);
 		try {
-			if (!window.vault) {
-				console.error('[VaultScreen] window.vault is undefined!');
-				alert('Vault API not available. Please restart the app.');
+			const result = await window.vault.restoreBackup();
+			if (result.canceled) {
 				return;
 			}
-
-			// Check if function exists
-			if (typeof window.vault.generateBackupCodes !== 'function') {
-				console.error('[VaultScreen] generateBackupCodes is not a function!');
-				alert('Backup codes feature not available. Please restart the app to apply updates.');
-				return;
+			if (result.success && result.restarting) {
+				// App will restart - show brief message
+				alert('Restore complete. The app will restart now.');
 			}
-
-			setIsGeneratingCodes(true);
-			const codes = await window.vault.generateBackupCodes(masterPassword);
-			setGeneratedBackupCodes(codes);
-			await loadRecoverySettings();
 		} catch (error) {
-			console.error('[VaultScreen] Error generating backup codes:', error);
+			console.error('[VaultScreen] Error restoring backup:', error);
 			const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-			alert(`Failed to generate backup codes: ${errorMessage}`);
+			alert(`Failed to restore backup: ${errorMessage}`);
 		} finally {
-			setIsGeneratingCodes(false);
+			setIsRestoringBackup(false);
 		}
 	};
 
@@ -952,6 +964,23 @@ const VaultScreen: React.FC<Props> = ({ masterPassword, onAutoLock }) => {
 		return entry.name.toLowerCase().includes(query) || (entry.username && entry.username.toLowerCase().includes(query));
 	});
 
+	// Sort filtered entries
+	const sortedEntries = [...filteredEntries].sort((a, b) => {
+		const mult = sortOrder === 'asc' ? 1 : -1;
+		if (sortBy === 'name') {
+			return mult * a.name.localeCompare(b.name, undefined, { sensitivity: 'base' });
+		}
+		if (sortBy === 'category') {
+			const catA = DEFAULT_CATEGORIES.find(c => c.id === a.category)?.name ?? a.category;
+			const catB = DEFAULT_CATEGORIES.find(c => c.id === b.category)?.name ?? b.category;
+			return mult * catA.localeCompare(catB, undefined, { sensitivity: 'base' });
+		}
+		// sortBy === 'date'
+		const dateA = new Date(a.last_modified || a.created_at || 0).getTime();
+		const dateB = new Date(b.last_modified || b.created_at || 0).getTime();
+		return mult * (dateA - dateB);
+	});
+
 	// Auto-suggest category when service name changes (only if category hasn't been manually changed)
 	const handleServiceNameChange = (name: string) => {
 		setForm(prev => {
@@ -992,7 +1021,7 @@ const VaultScreen: React.FC<Props> = ({ masterPassword, onAutoLock }) => {
 	return (
 		<div className='vault-container'>
 			<div className='vault-header'>
-				<div className='auto-lock-display'>
+				<div className='auto-lock-display' title='Ctrl+L to lock now'>
 					<span className='auto-lock-label'>Auto-lock in:</span>
 					<span
 						className='auto-lock-timer'
@@ -1011,6 +1040,16 @@ const VaultScreen: React.FC<Props> = ({ masterPassword, onAutoLock }) => {
 							<button
 								className='menu-item'
 								onClick={() => {
+									onAutoLock();
+									setShowMenu(false);
+								}}
+								title='Ctrl+L'>
+								<LogOut size={16} />
+								<span>Lock (Ctrl+L)</span>
+							</button>
+							<button
+								className='menu-item'
+								onClick={() => {
 									setShowChangePasswordModal(true);
 									setShowMenu(false);
 								}}>
@@ -1026,6 +1065,28 @@ const VaultScreen: React.FC<Props> = ({ masterPassword, onAutoLock }) => {
 								}}>
 								<Key size={16} />
 								<span>Recovery Settings</span>
+							</button>
+							<button
+								className='menu-item'
+								onClick={() => {
+									handleExportBackup();
+									setShowMenu(false);
+								}}
+								disabled={isExportingBackup}
+								title='Save a copy of your vault to a file'>
+								<HardDrive size={16} />
+								<span>{isExportingBackup ? 'Exporting...' : 'Backup Vault'}</span>
+							</button>
+							<button
+								className='menu-item'
+								onClick={() => {
+									handleRestoreBackup();
+									setShowMenu(false);
+								}}
+								disabled={isRestoringBackup}
+								title='Restore vault from a backup file (replaces current data)'>
+								<Upload size={16} />
+								<span>{isRestoringBackup ? 'Restoring...' : 'Restore from Backup'}</span>
 							</button>
 							<button
 								className='menu-item'
@@ -1079,8 +1140,9 @@ const VaultScreen: React.FC<Props> = ({ masterPassword, onAutoLock }) => {
 						}}>
 						<div className='form-row'>
 							<input
+								ref={addFormServiceRef}
 								type='text'
-								placeholder='Service (required)'
+								placeholder='Service (required) (Ctrl+N)'
 								value={form.name}
 								onChange={e => handleServiceNameChange(e.target.value)}
 								className='form-input'
@@ -1094,6 +1156,28 @@ const VaultScreen: React.FC<Props> = ({ masterPassword, onAutoLock }) => {
 								onChange={e => setForm({ ...form, username: e.target.value })}
 								className='form-input'
 								disabled={isAdding}
+							/>
+						</div>
+						<div className='form-row'>
+							<input
+								type='text'
+								placeholder='URL (optional, e.g. https://example.com)'
+								value={form.url}
+								onChange={e => setForm({ ...form, url: e.target.value })}
+								className='form-input'
+								disabled={isAdding}
+								style={{ flex: 1 }}
+							/>
+						</div>
+						<div className='form-row'>
+							<textarea
+								placeholder='Notes (optional, e.g. PIN, security questions)'
+								value={form.notes}
+								onChange={e => setForm({ ...form, notes: e.target.value })}
+								className='form-input'
+								disabled={isAdding}
+								rows={2}
+								style={{ resize: 'vertical', minHeight: '50px' }}
 							/>
 						</div>
 						<div className='form-row'>
@@ -1172,12 +1256,12 @@ const VaultScreen: React.FC<Props> = ({ masterPassword, onAutoLock }) => {
 													? 'selected'
 													: ''
 												: showEditModal
-												? editForm.category === category.id
-													? 'selected'
-													: ''
-												: form.category === category.id
-												? 'selected'
-												: ''
+													? editForm.category === category.id
+														? 'selected'
+														: ''
+													: form.category === category.id
+														? 'selected'
+														: ''
 										}`}
 										onClick={() => {
 											if (showBulkEditModal) {
@@ -1196,6 +1280,41 @@ const VaultScreen: React.FC<Props> = ({ masterPassword, onAutoLock }) => {
 										</div>
 										<span className='category-name'>{category.name}</span>
 									</div>
+								))}
+							</div>
+						</div>
+					</div>
+				)}
+
+				{/* Sort Modal */}
+				{showSortModal && (
+					<div className='modal-overlay' onClick={() => setShowSortModal(false)}>
+						<div className='category-modal' onClick={e => e.stopPropagation()} style={{ maxWidth: '280px' }}>
+							<div className='modal-header'>
+								<h3>Sort by</h3>
+								<button className='modal-close' onClick={() => setShowSortModal(false)} title='Close'>
+									×
+								</button>
+							</div>
+							<div className='sort-options'>
+								{[
+									{ sortBy: 'name' as const, sortOrder: 'asc' as const, label: 'Name A→Z' },
+									{ sortBy: 'name' as const, sortOrder: 'desc' as const, label: 'Name Z→A' },
+									{ sortBy: 'date' as const, sortOrder: 'desc' as const, label: 'Newest first' },
+									{ sortBy: 'date' as const, sortOrder: 'asc' as const, label: 'Oldest first' },
+									{ sortBy: 'category' as const, sortOrder: 'asc' as const, label: 'Category A→Z' },
+									{ sortBy: 'category' as const, sortOrder: 'desc' as const, label: 'Category Z→A' },
+								].map(opt => (
+									<button
+										key={`${opt.sortBy}-${opt.sortOrder}`}
+										className={`sort-option ${sortBy === opt.sortBy && sortOrder === opt.sortOrder ? 'selected' : ''}`}
+										onClick={() => {
+											setSortBy(opt.sortBy);
+											setSortOrder(opt.sortOrder);
+											setShowSortModal(false);
+										}}>
+										{opt.label}
+									</button>
 								))}
 							</div>
 						</div>
@@ -1241,6 +1360,52 @@ const VaultScreen: React.FC<Props> = ({ masterPassword, onAutoLock }) => {
 										<span className='category-name'>{category.name}</span>
 									</div>
 								))}
+							</div>
+						</div>
+					</div>
+				)}
+
+				{/* Notes Modal */}
+				{showNotesModal && entryForNotes && (
+					<div className='modal-overlay' onClick={() => { setShowNotesModal(false); setEntryForNotes(null); }}>
+						<div className='category-modal' onClick={e => e.stopPropagation()} style={{ maxWidth: '450px' }}>
+							<div className='modal-header'>
+								<h3>Notes – {entryForNotes.name}</h3>
+								<button
+									className='modal-close'
+									onClick={() => { setShowNotesModal(false); setEntryForNotes(null); }}
+									title='Close'>
+									×
+								</button>
+							</div>
+							<div style={{ padding: '20px' }}>
+								<div
+									style={{
+										whiteSpace: 'pre-wrap',
+										wordBreak: 'break-word',
+										color: 'var(--text-primary)',
+										fontSize: '14px',
+										lineHeight: 1.5,
+										marginBottom: '16px',
+									}}>
+									{entryForNotes.notes}
+								</div>
+								<button
+									type='button'
+									onClick={() => {
+										copyToClipboard(entryForNotes.notes || '', 'Notes', `notes-modal-${entryForNotes.id}`);
+									}}
+									className='submit-button'
+									style={{ marginRight: '8px' }}>
+									{copiedItem === `notes-modal-${entryForNotes.id}` ? <Check size={16} style={{ marginRight: '6px', verticalAlign: 'middle' }} /> : <Copy size={16} style={{ marginRight: '6px', verticalAlign: 'middle' }} />}
+									Copy
+								</button>
+								<button
+									type='button'
+									className='delete-cancel'
+									onClick={() => { setShowNotesModal(false); setEntryForNotes(null); }}>
+									Close
+								</button>
 							</div>
 						</div>
 					</div>
@@ -1334,6 +1499,28 @@ const VaultScreen: React.FC<Props> = ({ masterPassword, onAutoLock }) => {
 									/>
 								</div>
 								<div className='form-row'>
+									<input
+										type='text'
+										placeholder='URL (optional, e.g. https://example.com)'
+										value={editForm.url}
+										onChange={e => setEditForm({ ...editForm, url: e.target.value })}
+										className='form-input'
+										disabled={isEditing}
+										style={{ flex: 1 }}
+									/>
+								</div>
+								<div className='form-row'>
+									<textarea
+										placeholder='Notes (optional, e.g. PIN, security questions)'
+										value={editForm.notes}
+										onChange={e => setEditForm({ ...editForm, notes: e.target.value })}
+										className='form-input'
+										disabled={isEditing}
+										rows={2}
+										style={{ resize: 'vertical', minHeight: '50px' }}
+									/>
+								</div>
+								<div className='form-row'>
 									<div className='password-input-group'>
 										<input
 											type='password'
@@ -1387,7 +1574,7 @@ const VaultScreen: React.FC<Props> = ({ masterPassword, onAutoLock }) => {
 										disabled={isEditing}>
 										{renderCategoryIcon(
 											DEFAULT_CATEGORIES.find(cat => cat.id === editForm.category)?.icon || 'Key',
-											16
+											16,
 										)}
 										<span>
 											{DEFAULT_CATEGORIES.find(cat => cat.id === editForm.category)?.name || 'Select Category'}
@@ -1422,7 +1609,6 @@ const VaultScreen: React.FC<Props> = ({ masterPassword, onAutoLock }) => {
 											currentPassword: '',
 											newPassword: '',
 											confirmPassword: '',
-											passwordHint: '',
 										});
 										setNewPasswordStrength(null);
 									}}
@@ -1498,20 +1684,6 @@ const VaultScreen: React.FC<Props> = ({ masterPassword, onAutoLock }) => {
 											<span style={{ color: '#ef4444', fontSize: '12px' }}>Passwords do not match</span>
 										)}
 								</div>
-								<div className='form-row'>
-									<input
-										type='text'
-										placeholder='Password Hint (optional) - Helps you remember your password'
-										value={changePasswordForm.passwordHint}
-										onChange={e => setChangePasswordForm({ ...changePasswordForm, passwordHint: e.target.value })}
-										className='form-input'
-										disabled={isChangingPassword}
-										maxLength={200}
-									/>
-									<div style={{ fontSize: '12px', color: 'var(--text-secondary)', marginTop: '4px' }}>
-										This hint will be encrypted and can help you remember your password if you forget it.
-									</div>
-								</div>
 								<div
 									className='form-actions'
 									style={{
@@ -1531,7 +1703,6 @@ const VaultScreen: React.FC<Props> = ({ masterPassword, onAutoLock }) => {
 												currentPassword: '',
 												newPassword: '',
 												confirmPassword: '',
-												passwordHint: '',
 											});
 											setNewPasswordStrength(null);
 										}}
@@ -1612,10 +1783,10 @@ const VaultScreen: React.FC<Props> = ({ masterPassword, onAutoLock }) => {
 												await (window.vault as any).setupEmailSMSRecovery(
 													emailSMSRecovery.email,
 													emailSMSRecovery.phone,
-													masterPassword
+													masterPassword,
 												);
 												alert(
-													'Email/SMS recovery set up successfully! You can now use this method to recover your password.'
+													'Email/SMS recovery set up successfully! You can now use this method to recover your password.',
 												);
 												setEmailSMSRecovery({ email: '', phone: '' });
 											} catch (error) {
@@ -1629,168 +1800,6 @@ const VaultScreen: React.FC<Props> = ({ masterPassword, onAutoLock }) => {
 										className='submit-button'
 										style={{ width: '100%', background: '#10b981' }}>
 										{isSettingUpEmailSMS ? 'Setting up...' : 'Set Up Email/SMS Recovery'}
-									</button>
-								</div>
-
-								{/* Recovery Questions Section */}
-								<div style={{ marginBottom: '32px', borderTop: '1px solid var(--border-color)', paddingTop: '32px' }}>
-									<h4 style={{ marginBottom: '16px', color: 'var(--text-primary)' }}>Security Questions</h4>
-									<p style={{ fontSize: '13px', color: 'var(--text-secondary)', marginBottom: '16px' }}>
-										Set up security questions to recover your password if you forget it. You can set 1-5 questions.
-									</p>
-
-									{recoveryQuestions.map((q, index) => (
-										<div
-											key={index}
-											style={{
-												marginBottom: '16px',
-												padding: '16px',
-												background: 'var(--bg-secondary)',
-												borderRadius: '8px',
-											}}>
-											<div className='form-row' style={{ marginBottom: '12px' }}>
-												<input
-													type='text'
-													placeholder={`Question ${index + 1} (e.g., "What city were you born in?")`}
-													value={q.question}
-													onChange={e => {
-														const newQuestions = [...recoveryQuestions];
-														newQuestions[index].question = e.target.value;
-														setRecoveryQuestions(newQuestions);
-													}}
-													className='form-input'
-													disabled={isSavingRecoveryQuestions}
-												/>
-											</div>
-											<div className='form-row'>
-												<input
-													type='password'
-													placeholder={`Answer ${index + 1}`}
-													value={q.answer}
-													onChange={e => {
-														const newQuestions = [...recoveryQuestions];
-														newQuestions[index].answer = e.target.value;
-														setRecoveryQuestions(newQuestions);
-													}}
-													className='form-input'
-													disabled={isSavingRecoveryQuestions}
-												/>
-											</div>
-											{recoveryQuestions.length > 1 && (
-												<button
-													type='button'
-													onClick={() => {
-														setRecoveryQuestions(recoveryQuestions.filter((_, i) => i !== index));
-													}}
-													style={{
-														marginTop: '8px',
-														padding: '4px 8px',
-														background: '#dc2626',
-														color: 'white',
-														border: 'none',
-														borderRadius: '4px',
-														fontSize: '12px',
-														cursor: 'pointer',
-													}}>
-													Remove
-												</button>
-											)}
-										</div>
-									))}
-
-									{recoveryQuestions.length < 5 && (
-										<button
-											type='button'
-											onClick={() => setRecoveryQuestions([...recoveryQuestions, { question: '', answer: '' }])}
-											style={{
-												marginBottom: '16px',
-												padding: '8px 16px',
-												background: 'var(--bg-primary)',
-												border: '1px solid var(--border-color)',
-												borderRadius: '4px',
-												color: 'var(--text-primary)',
-												cursor: 'pointer',
-											}}>
-											+ Add Question
-										</button>
-									)}
-
-									<button
-										type='button'
-										onClick={handleSaveRecoveryQuestions}
-										disabled={isSavingRecoveryQuestions}
-										className='submit-button'
-										style={{ width: '100%' }}>
-										{isSavingRecoveryQuestions ? 'Saving...' : 'Save Recovery Questions'}
-									</button>
-								</div>
-
-								{/* Backup Codes Section */}
-								<div style={{ borderTop: '1px solid var(--border-color)', paddingTop: '32px' }}>
-									<h4 style={{ marginBottom: '16px', color: 'var(--text-primary)' }}>Backup Codes</h4>
-									<p style={{ fontSize: '13px', color: 'var(--text-secondary)', marginBottom: '16px' }}>
-										Backup codes are one-time use codes that can help you recover your password. Generate new codes and
-										save them in a safe place.
-									</p>
-
-									{backupCodesStatus.total > 0 && (
-										<div
-											style={{
-												marginBottom: '16px',
-												padding: '12px',
-												background: 'var(--bg-secondary)',
-												borderRadius: '8px',
-											}}>
-											<div style={{ fontSize: '14px', color: 'var(--text-primary)' }}>
-												<strong>Status:</strong> {backupCodesStatus.unused} unused, {backupCodesStatus.used} used out of{' '}
-												{backupCodesStatus.total} total codes
-											</div>
-										</div>
-									)}
-
-									{generatedBackupCodes.length > 0 && (
-										<div
-											style={{
-												marginBottom: '16px',
-												padding: '16px',
-												background: 'rgba(59, 130, 246, 0.1)',
-												border: '1px solid var(--accent-color)',
-												borderRadius: '8px',
-											}}>
-											<div style={{ fontWeight: '600', marginBottom: '12px', color: 'var(--accent-color)' }}>
-												⚠️ Save these codes now! They will not be shown again.
-											</div>
-											<div
-												style={{
-													display: 'grid',
-													gridTemplateColumns: 'repeat(2, 1fr)',
-													gap: '8px',
-													fontFamily: 'monospace',
-													fontSize: '14px',
-												}}>
-												{generatedBackupCodes.map((code, i) => (
-													<div
-														key={i}
-														style={{
-															padding: '8px',
-															background: 'var(--bg-primary)',
-															borderRadius: '4px',
-															textAlign: 'center',
-														}}>
-														{code}
-													</div>
-												))}
-											</div>
-										</div>
-									)}
-
-									<button
-										type='button'
-										onClick={handleGenerateBackupCodes}
-										disabled={isGeneratingCodes}
-										className='submit-button'
-										style={{ width: '100%' }}>
-										{isGeneratingCodes ? 'Generating...' : 'Generate New Backup Codes'}
 									</button>
 								</div>
 							</div>
@@ -2186,7 +2195,7 @@ const VaultScreen: React.FC<Props> = ({ masterPassword, onAutoLock }) => {
 										disabled={isBulkEditing}>
 										{renderCategoryIcon(
 											DEFAULT_CATEGORIES.find(cat => cat.id === bulkEditForm.category)?.icon || 'Key',
-											16
+											16,
 										)}
 										<span>
 											{DEFAULT_CATEGORIES.find(cat => cat.id === bulkEditForm.category)?.name || 'Select Category'}
@@ -2271,11 +2280,23 @@ const VaultScreen: React.FC<Props> = ({ masterPassword, onAutoLock }) => {
 							<span className='filter-arrow'>▼</span>
 						</button>
 
+						{/* Sort */}
+						<button className='category-filter-button' onClick={() => setShowSortModal(true)} title='Sort entries'>
+							<ArrowUpDown size={16} />
+							<span>
+								{sortBy === 'name' && (sortOrder === 'asc' ? 'Name A→Z' : 'Name Z→A')}
+								{sortBy === 'date' && (sortOrder === 'desc' ? 'Newest first' : 'Oldest first')}
+								{sortBy === 'category' && (sortOrder === 'asc' ? 'Category A→Z' : 'Category Z→A')}
+							</span>
+							<span className='filter-arrow'>▼</span>
+						</button>
+
 						{/* Search Bar */}
 						<div className='search-container'>
 							<input
+								ref={searchInputRef}
 								type='text'
-								placeholder='Search by service or username...'
+								placeholder='Search by service or username... (Ctrl+F)'
 								value={searchQuery}
 								onChange={e => setSearchQuery(e.target.value)}
 								className='search-input'
@@ -2326,7 +2347,7 @@ const VaultScreen: React.FC<Props> = ({ masterPassword, onAutoLock }) => {
 								</div>
 							)}
 							<div className='entries-list'>
-								{filteredEntries.map(entry => {
+								{sortedEntries.map(entry => {
 									const category =
 										DEFAULT_CATEGORIES.find(cat => cat.id === entry.category) ||
 										DEFAULT_CATEGORIES[DEFAULT_CATEGORIES.length - 1];
@@ -2385,7 +2406,7 @@ const VaultScreen: React.FC<Props> = ({ masterPassword, onAutoLock }) => {
 														} catch (error) {
 															console.error('[VaultScreen] Error getting password for copy:', error);
 															alert(
-																`Failed to get password: ${error instanceof Error ? error.message : 'Unknown error'}`
+																`Failed to get password: ${error instanceof Error ? error.message : 'Unknown error'}`,
 															);
 														}
 													}}
@@ -2398,6 +2419,43 @@ const VaultScreen: React.FC<Props> = ({ masterPassword, onAutoLock }) => {
 											<div className='entry-actions'>
 												{!bulkMode && (
 													<>
+														{entry.notes ? (
+															<button
+																type='button'
+																onClick={() => {
+																	setEntryForNotes(entry);
+																	setShowNotesModal(true);
+																}}
+																className='notes-button'
+																title='Show notes'>
+																<FileText size={16} />
+															</button>
+														) : (
+															<span className='notes-placeholder' aria-hidden />
+														)}
+														{entry.url ? (
+															<button
+																type='button'
+																onClick={async () => {
+																	try {
+																		if (window.app?.openExternal) {
+																			await window.app.openExternal(entry.url!);
+																		} else {
+																			alert('Opening URLs is not available. Please restart the app.');
+																		}
+																	} catch (err) {
+																		alert(
+																			`Failed to open URL: ${err instanceof Error ? err.message : 'Unknown error'}`,
+																		);
+																	}
+																}}
+																className='open-url-button'
+																title='Open website'>
+																<ExternalLink size={16} />
+															</button>
+														) : (
+															<span className='open-url-placeholder' aria-hidden />
+														)}
 														<button
 															onClick={() => handleHistoryClick(entry)}
 															className='history-button'

@@ -186,7 +186,7 @@ if (fs.existsSync(oldDbPath)) {
 				if (process.env.NODE_ENV !== 'production') {
 					console.log(
 						'[Vault] Could not verify entries table (possible schema mismatch), will attempt migration:',
-						tableError.message
+						tableError.message,
 					);
 				}
 				shouldMigrate = true;
@@ -265,9 +265,43 @@ try {
 			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 			last_modified DATETIME DEFAULT CURRENT_TIMESTAMP,
 			access_count INTEGER DEFAULT 0,
-			last_access DATETIME
+			last_access DATETIME,
+			url TEXT,
+			notes TEXT
 		)
 	`);
+
+	// Check if url column exists, if not add it
+	try {
+		const tableInfo = db.prepare('PRAGMA table_info(entries)').all();
+		const hasUrl = tableInfo.some(col => col.name === 'url');
+		if (!hasUrl) {
+			db.exec('ALTER TABLE entries ADD COLUMN url TEXT');
+			if (process.env.NODE_ENV !== 'production') {
+				console.log('[Vault] Added url column to entries table');
+			}
+		}
+	} catch (err) {
+		if (process.env.NODE_ENV !== 'production') {
+			console.log('[Vault] url column migration:', err.message);
+		}
+	}
+
+	// Check if notes column exists, if not add it
+	try {
+		const tableInfo = db.prepare('PRAGMA table_info(entries)').all();
+		const hasNotes = tableInfo.some(col => col.name === 'notes');
+		if (!hasNotes) {
+			db.exec('ALTER TABLE entries ADD COLUMN notes TEXT');
+			if (process.env.NODE_ENV !== 'production') {
+				console.log('[Vault] Added notes column to entries table');
+			}
+		}
+	} catch (err) {
+		if (process.env.NODE_ENV !== 'production') {
+			console.log('[Vault] notes column migration:', err.message);
+		}
+	}
 
 	// Check if category column exists, if not add it
 	try {
@@ -315,7 +349,7 @@ try {
 			if (process.env.NODE_ENV !== 'production') {
 				console.log(
 					'[Vault] Could not add enc_version column (may already exist or schema issue):',
-					alterError.message
+					alterError.message,
 				);
 			}
 		}
@@ -402,6 +436,17 @@ try {
 		console.log('[Vault] Indexes may already exist:', error.message);
 	}
 
+	// Create app credentials table (login before master password)
+	db.exec(`
+		CREATE TABLE IF NOT EXISTS app_credentials (
+			id INTEGER PRIMARY KEY CHECK (id = 1),
+			username TEXT NOT NULL UNIQUE,
+			password_hash TEXT NOT NULL,
+			password_salt TEXT NOT NULL,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		)
+	`);
+
 	// Create recovery questions table
 	// Answers are hashed (not encrypted) so they can be verified without master password
 	db.exec(`
@@ -412,17 +457,6 @@ try {
 			answer_hash TEXT NOT NULL,
 			answer_salt TEXT NOT NULL,
 			created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-		)
-	`);
-
-	// Create backup codes table
-	db.exec(`
-		CREATE TABLE IF NOT EXISTS backup_codes (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			code_hash TEXT NOT NULL UNIQUE,
-			used INTEGER DEFAULT 0,
-			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-			used_at DATETIME
 		)
 	`);
 
@@ -440,8 +474,7 @@ try {
 
 	// Create indexes for recovery tables
 	try {
-		db.exec('CREATE INDEX IF NOT EXISTS idx_backup_codes_hash ON backup_codes(code_hash)');
-		db.exec('CREATE INDEX IF NOT EXISTS idx_backup_codes_used ON backup_codes(used)');
+		db.exec('CREATE INDEX IF NOT EXISTS idx_recovery_codes_hash ON recovery_codes(code_hash)');
 	} catch (error) {
 		console.log('[Vault] Recovery indexes may already exist:', error.message);
 	}
@@ -489,6 +522,116 @@ function validateMasterPassword(password) {
 	}
 
 	return true;
+}
+
+// App login (username + password) - required before master password
+function hasAppAccount() {
+	try {
+		const stmt = db.prepare(`SELECT COUNT(*) as count FROM app_credentials WHERE id = 1`);
+		const result = stmt.get();
+		return result.count > 0;
+	} catch (error) {
+		return false;
+	}
+}
+
+function validateAppPassword(password) {
+	if (password.length < 8) {
+		throw new Error('Password must be at least 8 characters long');
+	}
+	if (!/[A-Z]/.test(password)) {
+		throw new Error('Password must contain at least one uppercase letter');
+	}
+	if (!/[a-z]/.test(password)) {
+		throw new Error('Password must contain at least one lowercase letter');
+	}
+	if (!/\d/.test(password)) {
+		throw new Error('Password must contain at least one number');
+	}
+	return true;
+}
+
+async function createAppAccount(username, password) {
+	if (!username || username.trim().length < 3) {
+		throw new Error('Username must be at least 3 characters');
+	}
+	validateAppPassword(password);
+
+	const salt = await generateSalt();
+	let hash;
+	if (cryptoWorkerRef) {
+		try {
+			const hashResult = await callWorkerCrypto('hashPBKDF2', {
+				password: password,
+				salt: salt,
+			});
+			if (hashResult && hashResult.hash) {
+				hash = hashResult.hash;
+			} else {
+				throw new Error('Worker hashPBKDF2 returned no result');
+			}
+		} catch (error) {
+			hash = crypto
+				.pbkdf2Sync(password, Buffer.from(salt, 'hex'), PBKDF2_ITERATIONS, KEY_LENGTH, 'sha256')
+				.toString('hex');
+		}
+	} else {
+		hash = crypto
+			.pbkdf2Sync(password, Buffer.from(salt, 'hex'), PBKDF2_ITERATIONS, KEY_LENGTH, 'sha256')
+			.toString('hex');
+	}
+
+	const insertStmt = db.prepare(`
+		INSERT OR REPLACE INTO app_credentials (id, username, password_hash, password_salt)
+		VALUES (1, ?, ?, ?)
+	`);
+	insertStmt.run(username.trim().toLowerCase(), hash, salt);
+}
+
+async function verifyAppLogin(username, password) {
+	const stmt = db.prepare(`SELECT username, password_hash, password_salt FROM app_credentials WHERE id = 1`);
+	const row = stmt.get();
+	if (!row) {
+		return false;
+	}
+	if (row.username.toLowerCase() !== username.trim().toLowerCase()) {
+		return false;
+	}
+
+	let testHash;
+	if (cryptoWorkerRef) {
+		try {
+			const hashResult = await callWorkerCrypto('hashPBKDF2', {
+				password: password,
+				salt: row.password_salt,
+			});
+			if (hashResult && hashResult.hash) {
+				testHash = hashResult.hash;
+			} else {
+				return false;
+			}
+		} catch (error) {
+			testHash = crypto
+				.pbkdf2Sync(password, Buffer.from(row.password_salt, 'hex'), PBKDF2_ITERATIONS, KEY_LENGTH, 'sha256')
+				.toString('hex');
+		}
+	} else {
+		testHash = crypto
+			.pbkdf2Sync(password, Buffer.from(row.password_salt, 'hex'), PBKDF2_ITERATIONS, KEY_LENGTH, 'sha256')
+			.toString('hex');
+	}
+
+	return testHash === row.password_hash;
+}
+
+function isMasterPasswordSet() {
+	try {
+		const stmt = db.prepare(`SELECT master_password_hash FROM security_metadata WHERE id = 1`);
+		const row = stmt.get();
+		return !!(row && row.master_password_hash && row.master_password_hash.length > 0);
+	} catch (error) {
+		return false;
+	}
 }
 
 // All cryptographic operations delegated to worker thread
@@ -724,7 +867,7 @@ async function decryptLegacy(ciphertext, password, salt, iv, entryId = null) {
 	}
 }
 
-async function addEntry(name, username, plainPassword, category, masterPassword) {
+async function addEntry(name, username, plainPassword, category, masterPassword, url, notes) {
 	// Note: Don't log masterPassword or plainPassword - minimize sensitive data in logs
 	console.log('[Vault] addEntry called for service:', name);
 
@@ -752,10 +895,20 @@ async function addEntry(name, username, plainPassword, category, masterPassword)
 		masterPassword = null;
 
 		const stmt = db.prepare(`
-      INSERT INTO entries (name, username, encrypted_password, category, salt, iv, enc_version) 
-      VALUES (?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO entries (name, username, encrypted_password, category, salt, iv, enc_version, url, notes) 
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
-		const result = stmt.run(name, username || '', encryptedPassword, category || 'personal', salt, iv, 'gcm');
+		const result = stmt.run(
+			name,
+			username || '',
+			encryptedPassword,
+			category || 'personal',
+			salt,
+			iv,
+			'gcm',
+			url || '',
+			notes || '',
+		);
 
 		return result.lastInsertRowid;
 	} catch (error) {
@@ -775,7 +928,7 @@ async function getAllEntries() {
 		}
 
 		const stmt = db.prepare(
-			`SELECT id, name, username, category, created_at, last_modified, enc_version FROM entries ORDER BY last_modified DESC`
+			`SELECT id, name, username, category, created_at, last_modified, enc_version, url, notes FROM entries ORDER BY last_modified DESC`,
 		);
 		const rows = stmt.all();
 
@@ -795,6 +948,8 @@ async function getAllEntries() {
 			created_at: row.created_at,
 			last_modified: row.last_modified,
 			enc_version: row.enc_version || 'cbc', // Default to 'cbc' for legacy entries
+			url: row.url || '',
+			notes: row.notes || '',
 		}));
 
 		if (process.env.NODE_ENV !== 'production') {
@@ -873,7 +1028,7 @@ async function saveEntryHistory(entryId, masterPassword) {
 			entry.salt,
 			entry.iv,
 			entryId,
-			entry.enc_version
+			entry.enc_version,
 		);
 		if (!decryptedPassword) {
 			console.warn(`[Vault] Cannot save history for entry ${entryId} - decryption failed`);
@@ -886,6 +1041,8 @@ async function saveEntryHistory(entryId, masterPassword) {
 			username: entry.username || '',
 			password: decryptedPassword,
 			category: entry.category || 'personal',
+			url: entry.url || '',
+			notes: entry.notes || '',
 		};
 
 		// Encrypt history data with master password
@@ -943,6 +1100,8 @@ async function getEntryHistory(entryId, masterPassword) {
 						username: data.username,
 						password: data.password,
 						category: data.category,
+						url: data.url || '',
+						notes: data.notes || '',
 						change_type: row.change_type,
 						created_at: row.created_at,
 					});
@@ -975,7 +1134,7 @@ async function rollbackEntry(entryId, historyId, masterPassword) {
 			masterPassword,
 			historyRow.salt,
 			historyRow.iv,
-			null
+			null,
 		);
 		if (!decryptedData) {
 			throw new Error('Failed to decrypt history data');
@@ -995,7 +1154,7 @@ async function rollbackEntry(entryId, historyId, masterPassword) {
 		// Always set enc_version to 'gcm' when updating (ensures consistency)
 		const updateStmt = db.prepare(`
 			UPDATE entries 
-			SET name = ?, username = ?, encrypted_password = ?, category = ?, salt = ?, iv = ?, enc_version = 'gcm', last_modified = CURRENT_TIMESTAMP
+			SET name = ?, username = ?, encrypted_password = ?, category = ?, salt = ?, iv = ?, enc_version = 'gcm', last_modified = CURRENT_TIMESTAMP, url = ?, notes = ?
 			WHERE id = ?
 		`);
 		const result = updateStmt.run(
@@ -1005,7 +1164,9 @@ async function rollbackEntry(entryId, historyId, masterPassword) {
 			historyData.category || 'personal',
 			newSalt,
 			newIV,
-			entryId
+			historyData.url || '',
+			historyData.notes || '',
+			entryId,
 		);
 
 		if (result.changes === 0) {
@@ -1020,7 +1181,7 @@ async function rollbackEntry(entryId, historyId, masterPassword) {
 	}
 }
 
-async function updateEntry(id, name, username, plainPassword, category, masterPassword) {
+async function updateEntry(id, name, username, plainPassword, category, masterPassword, url, notes) {
 	if (process.env.NODE_ENV !== 'production') {
 		console.log('[Vault] updateEntry called for entry ID:', id);
 	}
@@ -1055,7 +1216,7 @@ async function updateEntry(id, name, username, plainPassword, category, masterPa
 			existingEntry.salt,
 			existingEntry.iv,
 			id,
-			existingEntry.enc_version
+			existingEntry.enc_version,
 		);
 
 		if (!oldPassword) {
@@ -1080,10 +1241,10 @@ async function updateEntry(id, name, username, plainPassword, category, masterPa
 		// Always set enc_version to 'gcm' when updating (ensures consistency)
 		const stmt = db.prepare(`
 			UPDATE entries 
-			SET name = ?, username = ?, encrypted_password = ?, category = ?, salt = ?, iv = ?, enc_version = 'gcm', last_modified = CURRENT_TIMESTAMP
+			SET name = ?, username = ?, encrypted_password = ?, category = ?, salt = ?, iv = ?, enc_version = 'gcm', last_modified = CURRENT_TIMESTAMP, url = ?, notes = ?
 			WHERE id = ?
 		`);
-		const result = stmt.run(name, username || '', encryptedPassword, category || 'personal', salt, iv, id);
+		const result = stmt.run(name, username || '', encryptedPassword, category || 'personal', salt, iv, url || '', notes || '', id);
 
 		if (result.changes === 0) {
 			throw new Error('Failed to update entry');
@@ -1142,7 +1303,7 @@ async function changeMasterPassword(oldMasterPassword, newMasterPassword) {
 				row.salt,
 				row.iv,
 				row.id,
-				row.enc_version
+				row.enc_version,
 			);
 			if (testDecrypt) {
 				canDecryptCount++;
@@ -1151,7 +1312,7 @@ async function changeMasterPassword(oldMasterPassword, newMasterPassword) {
 			}
 		}
 		console.log(
-			`[Vault] Diagnostic: Can decrypt ${canDecryptCount} of ${testRows.length} test entries with provided password`
+			`[Vault] Diagnostic: Can decrypt ${canDecryptCount} of ${testRows.length} test entries with provided password`,
 		);
 	} catch (error) {
 		console.warn('[Vault] Diagnostic check failed:', error.message);
@@ -1208,7 +1369,7 @@ async function changeMasterPassword(oldMasterPassword, newMasterPassword) {
 					row.salt,
 					row.iv,
 					row.id,
-					row.enc_version
+					row.enc_version,
 				);
 				if (plainPassword && plainPassword.length > 0) {
 					decryptableEntries.push({ ...row, plainPassword });
@@ -1216,7 +1377,7 @@ async function changeMasterPassword(oldMasterPassword, newMasterPassword) {
 					failedEntries.push({ id: row.id, name: row.name || 'Unknown', reason: 'Decryption returned empty result' });
 					if (process.env.NODE_ENV !== 'production') {
 						console.warn(
-							`[Vault] Cannot decrypt entry ${row.id} (${row.name || 'Unknown'}) - decryption returned empty`
+							`[Vault] Cannot decrypt entry ${row.id} (${row.name || 'Unknown'}) - decryption returned empty`,
 						);
 					}
 				}
@@ -1231,7 +1392,7 @@ async function changeMasterPassword(oldMasterPassword, newMasterPassword) {
 		// If ALL entries fail, the password is definitely wrong
 		if (decryptableEntries.length === 0 && rows.length > 0) {
 			throw new Error(
-				'Cannot decrypt any entries with the provided current master password. Please verify your current password is correct.'
+				'Cannot decrypt any entries with the provided current master password. Please verify your current password is correct.',
 			);
 		}
 
@@ -1242,14 +1403,14 @@ async function changeMasterPassword(oldMasterPassword, newMasterPassword) {
 				.join(', ');
 			if (process.env.NODE_ENV !== 'production') {
 				console.warn(
-					`[Vault] Warning: ${failedEntries.length} entry/entries cannot be decrypted and will be skipped: ${failedDetails}`
+					`[Vault] Warning: ${failedEntries.length} entry/entries cannot be decrypted and will be skipped: ${failedDetails}`,
 				);
 			}
 		}
 
 		if (process.env.NODE_ENV !== 'production') {
 			console.log(
-				`[Vault] ${decryptableEntries.length} entries can be re-encrypted, ${failedEntries.length} will be skipped`
+				`[Vault] ${decryptableEntries.length} entries can be re-encrypted, ${failedEntries.length} will be skipped`,
 			);
 		}
 
@@ -1448,7 +1609,7 @@ async function testMasterPassword(masterPassword) {
 								Buffer.from(hashResult.password_salt, 'hex'),
 								PBKDF2_ITERATIONS,
 								KEY_LENGTH,
-								'sha256'
+								'sha256',
 							)
 							.toString('hex');
 					}
@@ -1460,7 +1621,7 @@ async function testMasterPassword(masterPassword) {
 							Buffer.from(hashResult.password_salt, 'hex'),
 							PBKDF2_ITERATIONS,
 							KEY_LENGTH,
-							'sha256'
+							'sha256',
 						)
 						.toString('hex');
 				}
@@ -1477,33 +1638,62 @@ async function testMasterPassword(masterPassword) {
 			if (testHash === hashResult.master_password_hash) {
 				// Reset failed attempts on successful login
 				const resetStmt = db.prepare(
-					`UPDATE security_metadata SET failed_attempts = 0, locked_until = NULL WHERE id = 1`
+					`UPDATE security_metadata SET failed_attempts = 0, locked_until = NULL WHERE id = 1`,
 				);
 				resetStmt.run();
 				return true;
 			}
 		}
 
-		// Fallback: try to decrypt an entry (for backward compatibility)
-		const testStmt = db.prepare(`SELECT id, encrypted_password, salt, iv, enc_version FROM entries LIMIT 1`);
-		const testRow = testStmt.get();
+		// Fallback: try to decrypt an entry (for backward compatibility - only when hash is empty)
+		// CBC decryption with wrong password can return garbage instead of failing - must validate result
+		const hashIsEmpty = !hashResult || !hashResult.master_password_hash || hashResult.master_password_hash.length === 0;
+		if (hashIsEmpty) {
+			const testStmt = db.prepare(`SELECT id, encrypted_password, salt, iv, enc_version FROM entries LIMIT 1`);
+			const testRow = testStmt.get();
 
-		if (testRow) {
-			const password = await decrypt(
-				testRow.encrypted_password,
-				masterPassword,
-				testRow.salt,
-				testRow.iv,
-				testRow.id,
-				testRow.enc_version
-			);
-			if (password !== null) {
-				// Reset failed attempts
-				const resetStmt = db.prepare(
-					`UPDATE security_metadata SET failed_attempts = 0, locked_until = NULL WHERE id = 1`
+			if (testRow) {
+				const decrypted = await decrypt(
+					testRow.encrypted_password,
+					masterPassword,
+					testRow.salt,
+					testRow.iv,
+					testRow.id,
+					testRow.enc_version,
 				);
-				resetStmt.run();
-				return true;
+				// CBC with wrong password can return garbage - only accept if it looks like valid password
+				const isValidPassword =
+					decrypted &&
+					typeof decrypted === 'string' &&
+					decrypted.length >= 1 &&
+					decrypted.length <= 512 &&
+					!decrypted.includes('\uFFFD') &&
+					!/[\x00-\x08\x0B\x0C\x0E-\x1F]/.test(decrypted) &&
+					/^[\x20-\x7E]+$/.test(decrypted); // printable ASCII only
+				if (isValidPassword) {
+					// Migrate: store hash so next time we use hash verification
+					const salt = await generateSalt();
+					let hash;
+					if (cryptoWorkerRef) {
+						try {
+							const hashRes = await callWorkerCrypto('hashPBKDF2', { password: masterPassword, salt });
+							hash = hashRes?.hash;
+						} catch (e) {
+							hash = crypto
+								.pbkdf2Sync(masterPassword, Buffer.from(salt, 'hex'), PBKDF2_ITERATIONS, KEY_LENGTH, 'sha256')
+								.toString('hex');
+						}
+					} else {
+						hash = crypto
+							.pbkdf2Sync(masterPassword, Buffer.from(salt, 'hex'), PBKDF2_ITERATIONS, KEY_LENGTH, 'sha256')
+							.toString('hex');
+					}
+					const updateStmt = db.prepare(
+						`UPDATE security_metadata SET master_password_hash = ?, password_salt = ?, failed_attempts = 0, locked_until = NULL WHERE id = 1`,
+					);
+					updateStmt.run(hash, salt);
+					return true;
+				}
 			}
 		}
 
@@ -1649,7 +1839,7 @@ async function diagnoseEntry(entryId, masterPassword) {
 					row.salt,
 					row.iv,
 					row.id,
-					row.enc_version
+					row.enc_version,
 				);
 				if (decrypted && decrypted.length > 0) {
 					diagnostics.canDecrypt = true;
@@ -1667,393 +1857,6 @@ async function diagnoseEntry(entryId, masterPassword) {
 		return diagnostics;
 	} catch (error) {
 		return { error: error.message };
-	}
-}
-
-async function setPasswordHint(hint, masterPassword) {
-	try {
-		if (!hint || !hint.trim()) {
-			// Clear hint if empty
-			const clearStmt = db.prepare(`
-				UPDATE security_metadata 
-				SET password_hint = NULL, hint_salt = NULL, hint_iv = NULL 
-				WHERE id = 1
-			`);
-			clearStmt.run();
-			console.log('[Vault] Password hint cleared');
-			return true;
-		}
-
-		// Encrypt hint with master password
-		const hintSalt = await generateSalt();
-		const hintIV = await generateIV();
-		const encryptedHint = await encrypt(hint.trim(), masterPassword, hintSalt, hintIV);
-
-		// Store encrypted hint
-		const stmt = db.prepare(`
-			UPDATE security_metadata 
-			SET password_hint = ?, hint_salt = ?, hint_iv = ? 
-			WHERE id = 1
-		`);
-		stmt.run(encryptedHint, hintSalt, hintIV);
-
-		console.log('[Vault] Password hint set successfully');
-		return true;
-	} catch (error) {
-		console.error('[Vault] Error setting password hint:', error);
-		throw error;
-	}
-}
-
-async function getPasswordHint(masterPassword) {
-	try {
-		const stmt = db.prepare(`SELECT password_hint, hint_salt, hint_iv FROM security_metadata WHERE id = 1`);
-		const result = stmt.get();
-
-		// Security: Don't reveal if hint exists or not
-		// Always attempt decryption to prevent information leakage
-		if (!result || !result.password_hint) {
-			// No hint exists, but return same format as decryption failure
-			// This prevents attackers from knowing if a hint exists
-			return { hint: null, error: 'decryption_failed' };
-		}
-
-		// Decrypt hint (hints don't need migration)
-		const decryptedHint = await decrypt(result.password_hint, masterPassword, result.hint_salt, result.hint_iv, null);
-
-		if (!decryptedHint) {
-			// Decryption failed - wrong password or corrupted data
-			// Return same error regardless of whether hint exists
-			return { hint: null, error: 'decryption_failed' };
-		}
-
-		// Success - return the hint
-		return { hint: decryptedHint };
-	} catch (error) {
-		console.error('[Vault] Error getting password hint:', error);
-		// Always return same error format - don't reveal if hint exists
-		return { hint: null, error: 'decryption_failed' };
-	}
-}
-
-// Recovery Questions Functions
-async function setRecoveryQuestions(questions, masterPassword) {
-	try {
-		// Validate input
-		if (!Array.isArray(questions) || questions.length === 0) {
-			throw new Error('At least one recovery question is required');
-		}
-
-		if (questions.length > 5) {
-			throw new Error('Maximum 5 recovery questions allowed');
-		}
-
-		// Clear existing questions
-		const clearStmt = db.prepare(`DELETE FROM recovery_questions`);
-		clearStmt.run();
-
-		// Insert new questions with hashed answers (not encrypted - so they can be verified without master password)
-		const insertStmt = db.prepare(`
-			INSERT INTO recovery_questions (question_number, question_text, answer_hash, answer_salt)
-			VALUES (?, ?, ?, ?)
-		`);
-
-		for (let i = 0; i < questions.length; i++) {
-			const q = questions[i];
-			if (!q.question || !q.answer) {
-				throw new Error(`Question ${i + 1} must have both question and answer`);
-			}
-
-			// Hash answer (like password) - can verify without master password
-			const answerSalt = await generateSalt();
-			let answerHash;
-			if (cryptoWorkerRef) {
-				try {
-					const hashResult = await callWorkerCrypto('hashPBKDF2', {
-						password: q.answer.trim().toLowerCase(),
-						salt: answerSalt,
-					});
-					if (hashResult && hashResult.hash) {
-						answerHash = hashResult.hash;
-					} else {
-						throw new Error('Worker hashPBKDF2 returned no result');
-					}
-				} catch (error) {
-					console.warn('[Vault] Worker hashPBKDF2 failed, using local crypto:', error.message);
-					answerHash = crypto
-						.pbkdf2Sync(
-							q.answer.trim().toLowerCase(),
-							Buffer.from(answerSalt, 'hex'),
-							PBKDF2_ITERATIONS,
-							KEY_LENGTH,
-							'sha256'
-						)
-						.toString('hex');
-				}
-			} else {
-				answerHash = crypto
-					.pbkdf2Sync(
-						q.answer.trim().toLowerCase(),
-						Buffer.from(answerSalt, 'hex'),
-						PBKDF2_ITERATIONS,
-						KEY_LENGTH,
-						'sha256'
-					)
-					.toString('hex');
-			}
-
-			insertStmt.run(i + 1, q.question.trim(), answerHash, answerSalt);
-		}
-
-		console.log(`[Vault] Set ${questions.length} recovery questions successfully`);
-		return true;
-	} catch (error) {
-		console.error('[Vault] Error setting recovery questions:', error);
-		throw error;
-	}
-}
-
-async function verifyRecoveryQuestions(answers) {
-	try {
-		// Get all recovery questions
-		const stmt = db.prepare(`SELECT * FROM recovery_questions ORDER BY question_number`);
-		const questions = stmt.all();
-
-		if (questions.length === 0) {
-			return { verified: false, error: 'No recovery questions set' };
-		}
-
-		if (!Array.isArray(answers) || answers.length !== questions.length) {
-			return { verified: false, error: `Please answer all ${questions.length} questions` };
-		}
-
-		// Verify each answer by hashing and comparing
-		let correctCount = 0;
-		for (let i = 0; i < questions.length; i++) {
-			const question = questions[i];
-			const providedAnswer = answers[i] ? answers[i].trim().toLowerCase() : '';
-
-			try {
-				// Hash the provided answer and compare
-				// Support both hex format (new) and CryptoJS format (legacy)
-				let testHash;
-				try {
-					if (cryptoWorkerRef) {
-						try {
-							const hashResult = await callWorkerCrypto('hashPBKDF2', {
-								password: providedAnswer,
-								salt: question.answer_salt,
-							});
-							if (hashResult && hashResult.hash) {
-								testHash = hashResult.hash;
-							} else {
-								throw new Error('Worker hashPBKDF2 returned no result');
-							}
-						} catch (error) {
-							console.warn('[Vault] Worker hashPBKDF2 failed, using local crypto:', error.message);
-							testHash = crypto
-								.pbkdf2Sync(
-									providedAnswer,
-									Buffer.from(question.answer_salt, 'hex'),
-									PBKDF2_ITERATIONS,
-									KEY_LENGTH,
-									'sha256'
-								)
-								.toString('hex');
-						}
-					} else {
-						testHash = crypto
-							.pbkdf2Sync(
-								providedAnswer,
-								Buffer.from(question.answer_salt, 'hex'),
-								PBKDF2_ITERATIONS,
-								KEY_LENGTH,
-								'sha256'
-							)
-							.toString('hex');
-					}
-				} catch (error) {
-					// Fallback to CryptoJS for legacy format
-					// Parse salt as hex (salt is stored as hex string in database)
-					const saltHex = CryptoJS.enc.Hex.parse(question.answer_salt);
-					testHash = CryptoJS.PBKDF2(providedAnswer, saltHex, {
-						keySize: KEY_LENGTH / 4,
-						iterations: PBKDF2_ITERATIONS,
-					}).toString();
-				}
-
-				if (testHash === question.answer_hash) {
-					correctCount++;
-				}
-			} catch (error) {
-				console.error(`[Vault] Error verifying answer for question ${question.question_number}:`, error);
-			}
-		}
-
-		// Require all answers to be correct for security
-		if (correctCount === questions.length) {
-			return { verified: true };
-		} else {
-			return { verified: false, error: 'One or more answers are incorrect' };
-		}
-	} catch (error) {
-		console.error('[Vault] Error verifying recovery questions:', error);
-		return { verified: false, error: 'Failed to verify recovery questions' };
-	}
-}
-
-function getRecoveryQuestions() {
-	try {
-		const stmt = db.prepare(`SELECT question_number, question_text FROM recovery_questions ORDER BY question_number`);
-		const questions = stmt.all();
-
-		if (questions.length === 0) {
-			return [];
-		}
-
-		// Return only question text (not answers)
-		return questions.map(q => ({
-			number: q.question_number,
-			question: q.question_text,
-		}));
-	} catch (error) {
-		console.error('[Vault] Error getting recovery questions:', error);
-		return [];
-	}
-}
-
-// Backup Codes Functions
-// Increased entropy: 12 characters in format XXXX-XXXX-XXXX
-function generateBackupCode() {
-	const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // Exclude confusing chars (0, O, I, 1)
-	let code = '';
-
-	// Generate 12 characters
-	for (let i = 0; i < 12; i++) {
-		code += chars.charAt(crypto.randomInt(0, chars.length));
-	}
-
-	// Format as XXXX-XXXX-XXXX for better readability
-	return code.substring(0, 4) + '-' + code.substring(4, 8) + '-' + code.substring(8, 12);
-}
-
-async function generateBackupCodes(masterPassword) {
-	try {
-		// Invalidate all existing backup codes for security
-		const invalidateStmt = db.prepare(`UPDATE backup_codes SET used = 1 WHERE used = 0`);
-		invalidateStmt.run();
-
-		// Generate 10 backup codes
-		const codes = [];
-		const insertStmt = db.prepare(`
-			INSERT INTO backup_codes (code_hash, used)
-			VALUES (?, 0)
-		`);
-
-		for (let i = 0; i < 10; i++) {
-			// Generate 12-character code in format XXXX-XXXX-XXXX
-			const code = generateBackupCode();
-			codes.push(code);
-
-			// Hash the normalized code (without dashes) - so it works even if password changes
-			const normalizedCode = code.replace(/-/g, '').toUpperCase();
-			let codeHash;
-			if (cryptoWorkerRef) {
-				try {
-					const hashResult = await callWorkerCrypto('hashSHA256', {
-						text: normalizedCode,
-					});
-					if (hashResult && hashResult.hash) {
-						codeHash = hashResult.hash;
-					} else {
-						throw new Error('Worker hashSHA256 returned no result');
-					}
-				} catch (error) {
-					console.warn('[Vault] Worker hashSHA256 failed, using local crypto:', error.message);
-					codeHash = crypto.createHash('sha256').update(normalizedCode).digest('hex');
-				}
-			} else {
-				codeHash = crypto.createHash('sha256').update(normalizedCode).digest('hex');
-			}
-			insertStmt.run(codeHash);
-		}
-
-		console.log('[Vault] Generated 10 backup codes');
-		return codes; // Return plain codes for user to save
-	} catch (error) {
-		console.error('[Vault] Error generating backup codes:', error);
-		throw error;
-	}
-}
-
-async function verifyBackupCode(code) {
-	try {
-		// Remove dashes and convert to uppercase
-		const normalizedCode = code ? code.replace(/-/g, '').toUpperCase() : '';
-
-		// Validate format: should be 12 alphanumeric characters
-		if (!normalizedCode || normalizedCode.length !== 12 || !/^[A-Z2-9]{12}$/.test(normalizedCode)) {
-			return { verified: false, error: 'Invalid backup code format. Expected format: XXXX-XXXX-XXXX' };
-		}
-
-		// Hash the normalized code (without dashes)
-		let codeHash;
-		if (cryptoWorkerRef) {
-			try {
-				const hashResult = await callWorkerCrypto('hashSHA256', {
-					text: normalizedCode,
-				});
-				if (hashResult && hashResult.hash) {
-					codeHash = hashResult.hash;
-				} else {
-					throw new Error('Worker hashSHA256 returned no result');
-				}
-			} catch (error) {
-				console.warn('[Vault] Worker hashSHA256 failed, using local crypto:', error.message);
-				codeHash = crypto.createHash('sha256').update(normalizedCode).digest('hex');
-			}
-		} else {
-			codeHash = crypto.createHash('sha256').update(normalizedCode).digest('hex');
-		}
-
-		// Check if code exists and is unused
-		const stmt = db.prepare(`SELECT id, used FROM backup_codes WHERE code_hash = ?`);
-		const result = stmt.get(codeHash);
-
-		if (!result) {
-			return { verified: false, error: 'Invalid backup code' };
-		}
-
-		if (result.used === 1) {
-			return { verified: false, error: 'This backup code has already been used' };
-		}
-
-		// Mark code as used
-		const updateStmt = db.prepare(`UPDATE backup_codes SET used = 1, used_at = CURRENT_TIMESTAMP WHERE id = ?`);
-		updateStmt.run(result.id);
-
-		console.log('[Vault] Backup code verified and marked as used');
-		return { verified: true };
-	} catch (error) {
-		console.error('[Vault] Error verifying backup code:', error);
-		return { verified: false, error: 'Failed to verify backup code' };
-	}
-}
-
-function getBackupCodesStatus() {
-	try {
-		const stmt = db.prepare(
-			`SELECT COUNT(*) as total, SUM(CASE WHEN used = 0 THEN 1 ELSE 0 END) as unused FROM backup_codes`
-		);
-		const result = stmt.get();
-		return {
-			total: result.total || 0,
-			unused: result.unused || 0,
-			used: (result.total || 0) - (result.unused || 0),
-		};
-	} catch (error) {
-		console.error('[Vault] Error getting backup codes status:', error);
-		return { total: 0, unused: 0, used: 0 };
 	}
 }
 
@@ -2288,7 +2091,7 @@ async function markRecoveryCodeAsUsed(code) {
 			codeHash = crypto.createHash('sha256').update(code).digest('hex');
 		}
 		const markUsedStmt = db.prepare(
-			`UPDATE recovery_codes SET used = 1, used_at = CURRENT_TIMESTAMP WHERE code_hash = ? AND used = 0`
+			`UPDATE recovery_codes SET used = 1, used_at = CURRENT_TIMESTAMP WHERE code_hash = ? AND used = 0`,
 		);
 		const result = markUsedStmt.run(codeHash);
 		if (result.changes > 0) {
@@ -2373,23 +2176,13 @@ async function resetMasterPasswordViaRecovery(newPassword, recoveryMethod, recov
 						recoveryKeyDerivation,
 						recoveryData_db.recovery_key_salt,
 						recoveryData_db.recovery_key_iv,
-						null
+						null,
 					);
 
 					if (!decryptedRecoveryKey || decryptedRecoveryKey !== recoveryData.recoveryKey) {
 						throw new Error('Invalid recovery key');
 					}
 				}
-			}
-		} else if (recoveryMethod === 'backup_code') {
-			const verifyResult = await verifyBackupCode(recoveryData.code);
-			if (!verifyResult.verified) {
-				throw new Error(verifyResult.error || 'Backup code verification failed');
-			}
-		} else if (recoveryMethod === 'questions') {
-			const verifyResult = await verifyRecoveryQuestions(recoveryData.answers);
-			if (!verifyResult.verified) {
-				throw new Error(verifyResult.error || 'Recovery questions verification failed');
 			}
 		} else {
 			throw new Error('Invalid recovery method');
@@ -2435,10 +2228,6 @@ async function resetMasterPasswordViaRecovery(newPassword, recoveryMethod, recov
 		const clearQuestionsStmt = db.prepare(`DELETE FROM recovery_questions`);
 		clearQuestionsStmt.run();
 
-		// Invalidate all remaining backup codes
-		const invalidateCodesStmt = db.prepare(`UPDATE backup_codes SET used = 1 WHERE used = 0`);
-		invalidateCodesStmt.run();
-
 		if (DEBUG_RECOVERY) {
 			console.log('[Vault] Master password reset via recovery (data loss - entries remain encrypted)');
 		}
@@ -2466,7 +2255,7 @@ async function migrateEntriesToGCM(masterPassword) {
 
 		// Get all CBC entries
 		const stmt = db.prepare(
-			`SELECT id, encrypted_password, salt, iv FROM entries WHERE enc_version = 'cbc' OR enc_version IS NULL`
+			`SELECT id, encrypted_password, salt, iv FROM entries WHERE enc_version = 'cbc' OR enc_version IS NULL`,
 		);
 		const rows = stmt.all();
 
@@ -2533,6 +2322,52 @@ async function migrateEntriesToGCM(masterPassword) {
 	}
 }
 
+// Backup: Copy database to user-chosen location
+function exportBackup(targetPath) {
+	if (!targetPath || typeof targetPath !== 'string') {
+		throw new Error('Invalid backup path');
+	}
+	if (!fs.existsSync(dbPath)) {
+		throw new Error('Vault database not found');
+	}
+	try {
+		fs.copyFileSync(dbPath, targetPath);
+		fs.chmodSync(targetPath, 0o600); // Read/write for owner only
+		if (process.env.NODE_ENV !== 'production') {
+			console.log('[Vault] Backup exported to:', targetPath);
+		}
+		return { success: true, path: targetPath };
+	} catch (error) {
+		console.error('[Vault] Export backup failed:', error);
+		throw error;
+	}
+}
+
+// Restore: Replace current database with backup file. Closes db - app must restart.
+function restoreBackup(sourcePath) {
+	if (!sourcePath || typeof sourcePath !== 'string') {
+		throw new Error('Invalid backup path');
+	}
+	if (!fs.existsSync(sourcePath)) {
+		throw new Error('Backup file not found');
+	}
+	try {
+		if (db) {
+			db.close();
+			db = null;
+		}
+		fs.copyFileSync(sourcePath, dbPath);
+		fs.chmodSync(dbPath, 0o600);
+		if (process.env.NODE_ENV !== 'production') {
+			console.log('[Vault] Restore complete. App will restart.');
+		}
+		return { success: true };
+	} catch (error) {
+		console.error('[Vault] Restore backup failed:', error);
+		throw error;
+	}
+}
+
 module.exports = {
 	addEntry,
 	getAllEntries,
@@ -2542,15 +2377,11 @@ module.exports = {
 	getEntryHistory,
 	rollbackEntry,
 	changeMasterPassword,
+	hasAppAccount,
+	createAppAccount,
+	verifyAppLogin,
+	isMasterPasswordSet,
 	testMasterPassword,
-	setPasswordHint,
-	getPasswordHint,
-	setRecoveryQuestions,
-	verifyRecoveryQuestions,
-	getRecoveryQuestions,
-	generateBackupCodes,
-	verifyBackupCode,
-	getBackupCodesStatus,
 	setupEmailSMSRecovery,
 	generateRecoveryCode,
 	verifyRecoveryCode,
@@ -2564,4 +2395,6 @@ module.exports = {
 	enhancedCleanup,
 	getEntryPassword, // Get password for single entry on demand
 	migrateEntriesToGCM, // Batch migration from CBC to GCM
+	exportBackup,
+	restoreBackup,
 };

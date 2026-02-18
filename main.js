@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, session } = require('electron');
+const { app, BrowserWindow, ipcMain, session, dialog, shell } = require('electron');
 const path = require('path');
 const { Worker } = require('worker_threads');
 const os = require('os');
@@ -105,31 +105,35 @@ function handleWorkerMessage(message) {
 
 function createWindow() {
 	const win = new BrowserWindow({
-		width: 1000,
-		height: 700,
+		width: 1280,
+		height: 800,
 		minWidth: 600,
 		minHeight: 400,
 		webPreferences: {
 			preload: path.join(__dirname, 'preload.js'),
 			contextIsolation: true,
 			nodeIntegration: false,
-			sandbox: false,
+			sandbox: true,
 		},
 		titleBarStyle: 'hiddenInset', // More secure title bar
 		webSecurity: true,
 		allowRunningInsecureContent: false,
 	});
 
-	win.loadURL('http://localhost:5175').catch(err => {
-		console.error('[Main] Failed to load URL:', err);
-		// Try alternative ports
-		win.loadURL('http://localhost:5174').catch(err2 => {
-			console.error('[Main] Failed to load alternative URL:', err2);
-			win.loadURL('http://localhost:5173').catch(err3 => {
-				console.error('[Main] Failed to load all alternative URLs:', err3);
+	// Production: load from built frontend; Development: load from Vite dev server
+	const isDev = !app.isPackaged;
+	if (isDev) {
+		win.loadURL('http://localhost:5175').catch(err => {
+			console.error('[Main] Failed to load URL:', err);
+			win.loadURL('http://localhost:5174').catch(err2 => {
+				win.loadURL('http://localhost:5173').catch(err3 => {
+					console.error('[Main] Failed to load all alternative URLs:', err3);
+				});
 			});
 		});
-	});
+	} else {
+		win.loadFile(path.join(__dirname, 'frontend', 'dist', 'index.html'));
+	}
 
 	// Set up auto-lock
 	setupAutoLock(win);
@@ -139,7 +143,7 @@ function createWindow() {
 
 	// Initialize vault worker
 	createVaultWorker();
-	
+
 	// Set worker reference in vault for crypto operations
 	setVaultCryptoWorker();
 }
@@ -185,16 +189,6 @@ function setupSecurityFeatures(win) {
 					return false;
 				}
 			}, true);
-			
-			// Screen capture detection
-			document.addEventListener('visibilitychange', () => {
-				if (document.hidden) {
-					// Page hidden - potential screen capture
-					if (window.vault && window.vault.reportSecurityEvent) {
-						window.vault.reportSecurityEvent('visibility_change');
-					}
-				}
-			});
 			
 		`);
 	});
@@ -270,7 +264,35 @@ app.on('before-quit', () => {
 	}
 });
 
-app.whenReady().then(createWindow);
+// Content Security Policy - restrict resource loading
+function setupContentSecurityPolicy() {
+	const csp = [
+		"default-src 'self'",
+		"script-src 'self' 'unsafe-inline' 'unsafe-eval'",
+		"style-src 'self' 'unsafe-inline'",
+		"img-src 'self' data: blob:",
+		"font-src 'self'",
+		"connect-src 'self' ws://localhost:* wss://localhost:* http://localhost:* https://localhost:*",
+		"frame-ancestors 'none'",
+		"base-uri 'self'",
+		"form-action 'self'",
+	].join('; ');
+
+	session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
+		if (details.resourceType === 'mainFrame') {
+			const responseHeaders = { ...details.responseHeaders };
+			responseHeaders['Content-Security-Policy'] = [csp];
+			callback({ responseHeaders });
+		} else {
+			callback({ responseHeaders: details.responseHeaders });
+		}
+	});
+}
+
+app.whenReady().then(() => {
+	setupContentSecurityPolicy();
+	createWindow();
+});
 
 // IPC Handlers - Make them non-blocking
 ipcMain.handle('vault:addEntry', async (event, entry) => {
@@ -285,7 +307,17 @@ ipcMain.handle('vault:addEntry', async (event, entry) => {
 
 	try {
 		// Call vault.js directly - worker is used internally by vault.js for crypto operations only
-		const result = await vault.addEntry(entry.name, entry.username, entry.password, entry.category, entry.masterPassword);
+		const url = entry.url != null ? String(entry.url) : '';
+		const notes = entry.notes != null ? String(entry.notes) : '';
+		const result = await vault.addEntry(
+			entry.name,
+			entry.username,
+			entry.password,
+			entry.category,
+			entry.masterPassword,
+			url,
+			notes,
+		);
 		return result;
 	} catch (error) {
 		if (process.env.NODE_ENV !== 'production') {
@@ -386,13 +418,17 @@ ipcMain.handle('vault:updateEntry', async (event, entry) => {
 
 	try {
 		// Call vault.js directly - worker is used internally by vault.js for crypto operations only
+		const url = entry.url != null ? String(entry.url) : '';
+		const notes = entry.notes != null ? String(entry.notes) : '';
 		const result = await vault.updateEntry(
 			entry.id,
 			entry.name,
 			entry.username,
 			entry.password,
 			entry.category,
-			entry.masterPassword
+			entry.masterPassword,
+			url,
+			notes,
 		);
 		return result;
 	} catch (error) {
@@ -466,6 +502,51 @@ ipcMain.handle('vault:deleteEntry', (event, id) => {
 	}
 });
 
+ipcMain.handle('vault:hasAppAccount', async () => {
+	try {
+		return vault.hasAppAccount();
+	} catch (error) {
+		if (process.env.NODE_ENV !== 'production') {
+			console.error('[Main] Error in vault:hasAppAccount:', error);
+		}
+		throw error;
+	}
+});
+
+ipcMain.handle('vault:createAppAccount', async (event, data) => {
+	try {
+		await vault.createAppAccount(data.username, data.password);
+		return { success: true };
+	} catch (error) {
+		if (process.env.NODE_ENV !== 'production') {
+			console.error('[Main] Error in vault:createAppAccount:', error);
+		}
+		throw error;
+	}
+});
+
+ipcMain.handle('vault:verifyAppLogin', async (event, data) => {
+	try {
+		return await vault.verifyAppLogin(data.username, data.password);
+	} catch (error) {
+		if (process.env.NODE_ENV !== 'production') {
+			console.error('[Main] Error in vault:verifyAppLogin:', error);
+		}
+		throw error;
+	}
+});
+
+ipcMain.handle('vault:isMasterPasswordSet', async () => {
+	try {
+		return vault.isMasterPasswordSet();
+	} catch (error) {
+		if (process.env.NODE_ENV !== 'production') {
+			console.error('[Main] Error in vault:isMasterPasswordSet:', error);
+		}
+		throw error;
+	}
+});
+
 ipcMain.handle('vault:testMasterPassword', async (event, masterPassword) => {
 	try {
 		// Call vault.js directly - worker is used internally by vault.js for crypto operations only
@@ -473,102 +554,6 @@ ipcMain.handle('vault:testMasterPassword', async (event, masterPassword) => {
 	} catch (error) {
 		if (process.env.NODE_ENV !== 'production') {
 			console.error('[Main] Error in vault:testMasterPassword:', error);
-		}
-		throw error;
-	}
-});
-
-ipcMain.handle('vault:setPasswordHint', async (event, data) => {
-	try {
-		// Call vault.js directly - worker is used internally by vault.js for crypto operations only
-		return await vault.setPasswordHint(data.hint, data.masterPassword);
-	} catch (error) {
-		if (process.env.NODE_ENV !== 'production') {
-			console.error('[Main] Error in vault:setPasswordHint:', error);
-		}
-		throw error;
-	}
-});
-
-ipcMain.handle('vault:getPasswordHint', async (event, masterPassword) => {
-	try {
-		// Call vault.js directly - worker is used internally by vault.js for crypto operations only
-		return await vault.getPasswordHint(masterPassword);
-	} catch (error) {
-		if (process.env.NODE_ENV !== 'production') {
-			console.error('[Main] Error in vault:getPasswordHint:', error);
-		}
-		throw error;
-	}
-});
-
-ipcMain.handle('vault:setRecoveryQuestions', async (event, data) => {
-	try {
-		// Call vault.js directly - worker is used internally by vault.js for crypto operations only
-		return await vault.setRecoveryQuestions(data.questions, data.masterPassword);
-	} catch (error) {
-		if (process.env.NODE_ENV !== 'production') {
-			console.error('[Main] Error in vault:setRecoveryQuestions:', error);
-		}
-		throw error;
-	}
-});
-
-ipcMain.handle('vault:verifyRecoveryQuestions', async (event, answers) => {
-	try {
-		// Call vault.js directly - worker is used internally by vault.js for crypto operations only
-		return await vault.verifyRecoveryQuestions(answers);
-	} catch (error) {
-		if (process.env.NODE_ENV !== 'production') {
-			console.error('[Main] Error in vault:verifyRecoveryQuestions:', error);
-		}
-		throw error;
-	}
-});
-
-ipcMain.handle('vault:getRecoveryQuestions', async (event) => {
-	try {
-		// Call vault.js directly - worker is used internally by vault.js for crypto operations only
-		return await vault.getRecoveryQuestions();
-	} catch (error) {
-		if (process.env.NODE_ENV !== 'production') {
-			console.error('[Main] Error in vault:getRecoveryQuestions:', error);
-		}
-		throw error;
-	}
-});
-
-ipcMain.handle('vault:generateBackupCodes', async (event, masterPassword) => {
-	try {
-		// Call vault.js directly - worker is used internally by vault.js for crypto operations only
-		return await vault.generateBackupCodes(masterPassword);
-	} catch (error) {
-		if (process.env.NODE_ENV !== 'production') {
-			console.error('[Main] Error in vault:generateBackupCodes:', error);
-		}
-		throw error;
-	}
-});
-
-ipcMain.handle('vault:verifyBackupCode', async (event, code) => {
-	try {
-		// Call vault.js directly - worker is used internally by vault.js for crypto operations only
-		return await vault.verifyBackupCode(code);
-	} catch (error) {
-		if (process.env.NODE_ENV !== 'production') {
-			console.error('[Main] Error in vault:verifyBackupCode:', error);
-		}
-		throw error;
-	}
-});
-
-ipcMain.handle('vault:getBackupCodesStatus', async (event) => {
-	try {
-		// Call vault.js directly - worker is used internally by vault.js for crypto operations only
-		return await vault.getBackupCodesStatus();
-	} catch (error) {
-		if (process.env.NODE_ENV !== 'production') {
-			console.error('[Main] Error in vault:getBackupCodesStatus:', error);
 		}
 		throw error;
 	}
@@ -628,6 +613,58 @@ ipcMain.handle('vault:getSecurityInfo', () => {
 		return result;
 	} catch (error) {
 		console.error('[Main] Error in vault:getSecurityInfo:', error);
+		throw error;
+	}
+});
+
+ipcMain.handle('vault:exportBackup', async event => {
+	try {
+		const win = BrowserWindow.fromWebContents(event.sender);
+		const { canceled, filePath } = await dialog.showSaveDialog(win || BrowserWindow.getFocusedWindow(), {
+			title: 'Save Vault Backup',
+			defaultPath: `password-manager-backup-${new Date().toISOString().slice(0, 10)}.db`,
+			filters: [{ name: 'Database', extensions: ['db'] }],
+		});
+		if (canceled || !filePath) return { success: false, canceled: true };
+		await vault.exportBackup(filePath);
+		return { success: true, path: filePath };
+	} catch (error) {
+		if (process.env.NODE_ENV !== 'production') console.error('[Main] Error in vault:exportBackup:', error);
+		throw error;
+	}
+});
+
+ipcMain.handle('vault:restoreBackup', async event => {
+	try {
+		const win = BrowserWindow.fromWebContents(event.sender);
+		const { canceled, filePaths } = await dialog.showOpenDialog(win || BrowserWindow.getFocusedWindow(), {
+			title: 'Restore Vault from Backup',
+			filters: [{ name: 'Database', extensions: ['db'] }],
+			properties: ['openFile'],
+		});
+		if (canceled || !filePaths || filePaths.length === 0) return { success: false, canceled: true };
+		await vault.restoreBackup(filePaths[0]);
+		app.relaunch();
+		app.quit();
+		return { success: true, restarting: true };
+	} catch (error) {
+		if (process.env.NODE_ENV !== 'production') console.error('[Main] Error in vault:restoreBackup:', error);
+		throw error;
+	}
+});
+
+ipcMain.handle('app:openExternal', async (event, url) => {
+	try {
+		if (typeof url !== 'string' || !url.trim()) return;
+		// Basic URL validation - allow http, https
+		const trimmed = url.trim();
+		if (!/^https?:\/\//i.test(trimmed)) {
+			await shell.openExternal('https://' + trimmed);
+		} else {
+			await shell.openExternal(trimmed);
+		}
+	} catch (error) {
+		if (process.env.NODE_ENV !== 'production') console.error('[Main] Error opening URL:', error);
 		throw error;
 	}
 });

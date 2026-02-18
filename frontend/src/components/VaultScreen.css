@@ -304,16 +304,52 @@ select.form-input:focus {
 	background-color: var(--bg-secondary);
 }
 
+.category-filter-button.selected {
+	border-color: var(--accent-color);
+	background: rgba(59, 130, 246, 0.1);
+}
+
 .filter-arrow {
 	font-size: 10px;
 	color: var(--text-secondary);
+}
+
+.sort-options {
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+	padding: 16px;
+}
+
+.sort-option {
+	padding: 10px 14px;
+	border: 1px solid var(--border-color);
+	border-radius: 6px;
+	background: var(--bg-primary);
+	color: var(--text-primary);
+	font-size: 14px;
+	cursor: pointer;
+	transition: all 0.2s ease;
+	text-align: left;
+}
+
+.sort-option:hover {
+	border-color: var(--accent-color);
+	background: var(--bg-secondary);
+}
+
+.sort-option.selected {
+	border-color: var(--accent-color);
+	background: rgba(59, 130, 246, 0.1);
 }
 
 /* Delete Confirmation Modal */
 .delete-modal {
 	background-color: var(--bg-primary);
 	border-radius: 12px;
-	box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04);
+	box-shadow:
+		0 20px 25px -5px rgba(0, 0, 0, 0.1),
+		0 10px 10px -5px rgba(0, 0, 0, 0.04);
 	max-width: 400px;
 	width: 90%;
 	max-height: 90vh;
@@ -388,7 +424,9 @@ select.form-input:focus {
 .password-generator-modal {
 	background-color: var(--bg-primary);
 	border-radius: 12px;
-	box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04);
+	box-shadow:
+		0 20px 25px -5px rgba(0, 0, 0, 0.1),
+		0 10px 10px -5px rgba(0, 0, 0, 0.04);
 	max-width: 500px;
 	width: 90%;
 	max-height: 90vh;
@@ -975,6 +1013,7 @@ select.form-input:focus {
 	transition: color 0.3s ease;
 }
 
+
 .history-button {
 	background: transparent;
 	color: var(--text-secondary);
@@ -1033,6 +1072,78 @@ select.form-input:focus {
 }
 
 .edit-button svg {
+	width: 18px;
+	height: 18px;
+}
+
+.open-url-button {
+	background: transparent;
+	color: var(--text-secondary);
+	border: none;
+	border-radius: 4px;
+	padding: 6px;
+	cursor: pointer;
+	transition: all 0.2s ease;
+	min-width: 32px;
+	height: 32px;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+}
+
+.open-url-button:hover {
+	background: rgba(59, 130, 246, 0.1);
+	color: var(--accent-color);
+	transform: scale(1.1);
+}
+
+.open-url-button:active {
+	background: rgba(59, 130, 246, 0.2);
+	transform: scale(0.95);
+}
+
+.open-url-button svg {
+	width: 18px;
+	height: 18px;
+}
+
+.open-url-placeholder,
+.notes-placeholder {
+	display: inline-block;
+	min-width: 32px;
+	width: 32px;
+	height: 32px;
+	flex-shrink: 0;
+	visibility: hidden;
+}
+
+.notes-button {
+	background: transparent;
+	color: var(--text-secondary);
+	border: none;
+	border-radius: 4px;
+	padding: 6px;
+	cursor: pointer;
+	transition: all 0.2s ease;
+	min-width: 32px;
+	height: 32px;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+}
+
+.notes-button:hover {
+	background: rgba(139, 92, 246, 0.1);
+	color: #8b5cf6;
+	transform: scale(1.1);
+}
+
+.notes-button:active {
+	background: rgba(139, 92, 246, 0.2);
+	transform: scale(0.95);
+}
+
+.notes-button svg {
 	width: 18px;
 	height: 18px;
 }

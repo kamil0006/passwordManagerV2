@@ -9,15 +9,8 @@ const LoginScreen: React.FC<Props> = ({ onLogin }) => {
 	const [password, setPassword] = useState('');
 	const [isValidating, setIsValidating] = useState(false);
 	const [error, setError] = useState('');
-	const [showHint, setShowHint] = useState(false);
-	const [hint, setHint] = useState<string | null>(null);
-	const [isLoadingHint, setIsLoadingHint] = useState(false);
-	const [hintError, setHintError] = useState<string | null>(null);
 	const [showForgotPassword, setShowForgotPassword] = useState(false); // Forgot password modal
-	const [recoveryMethod, setRecoveryMethod] = useState<'questions' | 'backup_code' | 'email_sms' | null>(null); // Recovery method selected
-	const [recoveryQuestions, setRecoveryQuestions] = useState<Array<{ number: number; question: string }>>([]); // Recovery questions
-	const [recoveryAnswers, setRecoveryAnswers] = useState<string[]>([]); // Answers to recovery questions
-	const [backupCode, setBackupCode] = useState(''); // Backup code input
+	const [recoveryMethod, setRecoveryMethod] = useState<'email_sms' | null>(null); // Recovery method selected
 	const [recoveryCode, setRecoveryCode] = useState(''); // Email/SMS recovery code
 	const [verifiedRecoveryCode, setVerifiedRecoveryCode] = useState<string | null>(null); // Verified recovery code (stored after verification)
 	const [recoveryEmail, setRecoveryEmail] = useState(''); // Email for recovery
@@ -29,50 +22,6 @@ const LoginScreen: React.FC<Props> = ({ onLogin }) => {
 	const [newPassword, setNewPassword] = useState(''); // New password for reset
 	const [confirmNewPassword, setConfirmNewPassword] = useState(''); // Confirm new password
 	const [isResettingPassword, setIsResettingPassword] = useState(false); // Resetting password
-
-	const handleShowHint = async () => {
-		if (!password || password.length < 12) {
-			setError('Please enter at least 12 characters of your password to view the hint');
-			return;
-		}
-
-		setIsLoadingHint(true);
-		setError('');
-		setHintError(null);
-
-		try {
-			if (!window.vault || typeof window.vault.getPasswordHint !== 'function') {
-				setError('Password hint feature not available');
-				return;
-			}
-
-			const result = await window.vault.getPasswordHint(password);
-			
-			if (!result) {
-				setHintError('Could not retrieve password hint.');
-				return;
-			}
-
-			if (result.error === 'decryption_failed') {
-				// Don't reveal if hint exists or not - same error for both cases
-				setHintError('Could not decrypt hint. The password you entered may be incorrect, or no hint is set for this vault.');
-				return;
-			}
-
-			if (result.hint) {
-				setHint(result.hint);
-				setShowHint(true);
-				setHintError(null);
-			} else {
-				setHintError('Could not retrieve password hint.');
-			}
-		} catch (error) {
-			console.error('[LoginScreen] Error getting password hint:', error);
-			setHintError('Could not retrieve password hint. The password you entered may be incorrect.');
-		} finally {
-			setIsLoadingHint(false);
-		}
-	};
 
 	const handleSubmit = async (e: React.FormEvent) => {
 		e.preventDefault();
@@ -137,45 +86,12 @@ const LoginScreen: React.FC<Props> = ({ onLogin }) => {
 							value={password}
 							onChange={e => {
 								setPassword(e.target.value);
-								if (error) setError(''); // Clear error when user types
-								if (showHint) {
-									setShowHint(false);
-									setHint(null);
-								}
+								if (error) setError('');
 							}}
 							className='login-input'
 							disabled={isValidating}
 						/>
 					</div>
-
-					{showHint && hint && (
-						<div style={{ 
-							marginBottom: '16px', 
-							padding: '12px', 
-							background: 'var(--bg-secondary)', 
-							border: '1px solid var(--border-color)', 
-							borderRadius: '8px',
-							fontSize: '14px',
-							color: 'var(--text-primary)'
-						}}>
-							<div style={{ fontWeight: '600', marginBottom: '4px', color: 'var(--accent-color)' }}>Password Hint:</div>
-							<div>{hint}</div>
-						</div>
-					)}
-
-					{hintError && (
-						<div style={{ 
-							marginBottom: '16px', 
-							padding: '12px', 
-							background: 'rgba(239, 68, 68, 0.1)', 
-							border: '1px solid #ef4444', 
-							borderRadius: '8px',
-							fontSize: '13px',
-							color: '#ef4444'
-						}}>
-							{hintError}
-						</div>
-					)}
 
 					{error && <div className='error-message'>{error}</div>}
 
@@ -185,37 +101,10 @@ const LoginScreen: React.FC<Props> = ({ onLogin }) => {
 						</button>
 						<button
 							type='button'
-							onClick={handleShowHint}
-							disabled={isValidating || isLoadingHint || password.length < 12}
-							style={{
-								padding: '10px',
-								background: 'transparent',
-								border: '1px solid var(--border-color)',
-								borderRadius: '8px',
-								color: 'var(--text-secondary)',
-								cursor: password.length < 12 ? 'not-allowed' : 'pointer',
-								opacity: password.length < 12 ? 0.5 : 1,
-								fontSize: '13px',
-							}}
-							title={password.length < 12 ? 'Enter at least 12 characters to view hint' : 'Show password hint'}>
-							{isLoadingHint ? 'Loading...' : 'Show Password Hint'}
-						</button>
-						<button
-							type='button'
 							onClick={async () => {
 								setShowForgotPassword(true);
 								setRecoveryMethod(null);
 								setRecoveryVerified(false);
-								// Load recovery questions if available
-								if (window.vault && typeof window.vault.getRecoveryQuestions === 'function') {
-									try {
-										const questions = await window.vault.getRecoveryQuestions();
-										setRecoveryQuestions(questions);
-										setRecoveryAnswers(new Array(questions.length).fill(''));
-									} catch (error) {
-										console.error('[LoginScreen] Error loading recovery questions:', error);
-									}
-								}
 							}}
 							disabled={isValidating}
 							style={{
@@ -259,93 +148,15 @@ const LoginScreen: React.FC<Props> = ({ onLogin }) => {
 											<p style={{ marginBottom: '20px', color: 'var(--text-secondary)' }}>
 												Choose a recovery method to reset your password:
 											</p>
-											<div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
-												<button
-													type='button'
-													onClick={() => setRecoveryMethod('email_sms')}
-													className='submit-button'
-													style={{ width: '100%', background: '#10b981' }}>
-													📧 Email/SMS Recovery (Preserves Data)
-												</button>
-												{recoveryQuestions.length > 0 && (
-													<button
-														type='button'
-														onClick={() => setRecoveryMethod('questions')}
-														className='submit-button'
-														style={{ width: '100%' }}>
-														Use Security Questions ({recoveryQuestions.length} questions)
-													</button>
-												)}
-												<button
-													type='button'
-													onClick={() => setRecoveryMethod('backup_code')}
-													className='submit-button'
-													style={{ width: '100%' }}>
-													Use Backup Code
-												</button>
-											</div>
+											<button
+												type='button'
+												onClick={() => setRecoveryMethod('email_sms')}
+												className='submit-button'
+												style={{ width: '100%', background: '#10b981' }}>
+												📧 Email/SMS Recovery (Preserves Data)
+											</button>
 										</>
-									) : recoveryMethod === 'questions' ? (
-										<>
-											<p style={{ marginBottom: '20px', color: 'var(--text-secondary)' }}>
-												Answer your security questions:
-											</p>
-											{recoveryQuestions.map((q, index) => (
-												<div key={q.number} style={{ marginBottom: '16px' }}>
-													<label style={{ display: 'block', marginBottom: '8px', color: 'var(--text-primary)' }}>
-														{q.question}
-													</label>
-													<input
-														type='password'
-														placeholder='Your answer'
-														value={recoveryAnswers[index] || ''}
-														onChange={e => {
-															const newAnswers = [...recoveryAnswers];
-															newAnswers[index] = e.target.value;
-															setRecoveryAnswers(newAnswers);
-														}}
-														className='login-input'
-														disabled={isVerifyingRecovery}
-													/>
-												</div>
-											))}
-											<div style={{ display: 'flex', gap: '10px', marginTop: '20px' }}>
-												<button
-													type='button'
-													onClick={() => setRecoveryMethod(null)}
-													className='delete-cancel'
-													disabled={isVerifyingRecovery}>
-													Back
-												</button>
-												<button
-													type='button'
-													onClick={async () => {
-														if (!window.vault || typeof window.vault.verifyRecoveryQuestions !== 'function') {
-															setError('Recovery feature not available');
-															return;
-														}
-														setIsVerifyingRecovery(true);
-														setError('');
-														try {
-															const result = await window.vault.verifyRecoveryQuestions(recoveryAnswers);
-															if (result.verified) {
-																setRecoveryVerified(true);
-															} else {
-																setError(result.error || 'Verification failed');
-															}
-														} catch (error) {
-															setError(error instanceof Error ? error.message : 'Verification failed');
-														} finally {
-															setIsVerifyingRecovery(false);
-														}
-													}}
-													disabled={isVerifyingRecovery || recoveryAnswers.some(a => !a.trim())}
-													className='submit-button'>
-													{isVerifyingRecovery ? 'Verifying...' : 'Verify'}
-												</button>
-											</div>
-										</>
-									) : recoveryMethod === 'email_sms' ? (
+									) : (
 										<>
 											{!generatedCode ? (
 												<>
@@ -569,116 +380,27 @@ const LoginScreen: React.FC<Props> = ({ onLogin }) => {
 												</>
 											)}
 										</>
-									) : (
-										<>
-											<p style={{ marginBottom: '20px', color: 'var(--text-secondary)' }}>
-												Enter your backup code:
-											</p>
-											<input
-												type='text'
-												placeholder='Backup Code (8 characters)'
-												value={backupCode}
-												onChange={e => {
-													const code = e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 8);
-													setBackupCode(code);
-												}}
-												className='login-input'
-												disabled={isVerifyingRecovery}
-												style={{ fontFamily: 'monospace', textAlign: 'center', letterSpacing: '2px', pointerEvents: 'auto' }}
-											/>
-											{error && <div className='error-message' style={{ marginTop: '12px' }}>{error}</div>}
-											<div style={{ display: 'flex', gap: '10px', marginTop: '20px' }}>
-												<button
-													type='button'
-													onClick={() => setRecoveryMethod(null)}
-													className='delete-cancel'
-													disabled={isVerifyingRecovery}>
-													Back
-												</button>
-												<button
-													type='button'
-													onClick={async () => {
-														if (!window.vault || typeof window.vault.verifyBackupCode !== 'function') {
-															setError('Backup code feature not available');
-															return;
-														}
-														if (backupCode.length !== 8) {
-															setError('Backup code must be 8 characters');
-															return;
-														}
-														setIsVerifyingRecovery(true);
-														setError('');
-														try {
-															const result = await window.vault.verifyBackupCode(backupCode);
-															if (result.verified) {
-																setRecoveryVerified(true);
-															} else {
-																setError(result.error || 'Invalid backup code');
-															}
-														} catch (error) {
-															setError(error instanceof Error ? error.message : 'Verification failed');
-														} finally {
-															setIsVerifyingRecovery(false);
-														}
-													}}
-													disabled={isVerifyingRecovery || backupCode.length !== 8}
-													className='submit-button'>
-													{isVerifyingRecovery ? 'Verifying...' : 'Verify'}
-												</button>
-											</div>
-										</>
 									)}
 								</>
 							) : (
 								<>
-									{recoveryMethod === 'email_sms' ? (
-										<div style={{ 
-											padding: '16px', 
-											background: 'rgba(16, 185, 129, 0.1)', 
-											border: '1px solid #10b981', 
-											borderRadius: '8px',
-											marginBottom: '20px',
-											fontSize: '13px',
-											color: '#10b981',
-											lineHeight: '1.6'
-										}}>
-											<div style={{ marginBottom: '8px' }}>
-												<strong>✅ Email/SMS Recovery:</strong>
-											</div>
-											<div>
-												All your password entries will be <strong>preserved and accessible</strong> after password reset. Your data will be automatically re-encrypted with your new password.
-											</div>
+									<div style={{ 
+										padding: '16px', 
+										background: 'rgba(16, 185, 129, 0.1)', 
+										border: '1px solid #10b981', 
+										borderRadius: '8px',
+										marginBottom: '20px',
+										fontSize: '13px',
+										color: '#10b981',
+										lineHeight: '1.6'
+									}}>
+										<div style={{ marginBottom: '8px' }}>
+											<strong>✅ Email/SMS Recovery:</strong>
 										</div>
-									) : (
-										<div style={{ 
-											padding: '16px', 
-											background: 'rgba(239, 68, 68, 0.1)', 
-											border: '1px solid #ef4444', 
-											borderRadius: '8px',
-											marginBottom: '20px',
-											fontSize: '13px',
-											color: '#ef4444',
-											lineHeight: '1.6'
-										}}>
-											<div style={{ marginBottom: '8px' }}>
-												<strong>⚠️ Important Warning:</strong>
-											</div>
-											<div style={{ marginBottom: '8px' }}>
-												When you reset your master password using this method, <strong>all your existing password entries will become permanently encrypted and unreadable</strong> because they were encrypted with your old password.
-											</div>
-											<div style={{ marginBottom: '8px' }}>
-												<strong>What this means:</strong>
-											</div>
-											<ul style={{ marginLeft: '20px', marginTop: '8px', marginBottom: '8px' }}>
-												<li>You will <strong>not be able to view or decrypt</strong> any of your saved passwords</li>
-												<li>You will need to <strong>manually delete all entries</strong> and recreate them with your new password</li>
-												<li>This is a <strong>one-way operation</strong> - there is no way to recover the old data</li>
-											</ul>
-											<div style={{ marginTop: '8px', fontStyle: 'italic' }}>
-												<strong>Better option:</strong> Use Email/SMS Recovery to preserve all your data, or if you remember your old password, use "Change Password" from the menu after logging in.
-											</div>
+										<div>
+											All your password entries will be <strong>preserved and accessible</strong> after password reset. Your data will be automatically re-encrypted with your new password.
 										</div>
-									)}
+									</div>
 									<div style={{ marginBottom: '16px' }}>
 										<input
 											type='password'
@@ -742,35 +464,16 @@ const LoginScreen: React.FC<Props> = ({ onLogin }) => {
 												setIsResettingPassword(true);
 												setError('');
 												try {
-													let recoveryData;
-													if (recoveryMethod === 'questions') {
-														recoveryData = { answers: recoveryAnswers, verified: true };
-													} else if (recoveryMethod === 'backup_code') {
-														if (!backupCode || backupCode.length !== 8) {
-															setError('Backup code is required');
-															setIsResettingPassword(false);
-															return;
-														}
-														recoveryData = { code: backupCode };
-													} else if (recoveryMethod === 'email_sms') {
-														// Use verified code if available, otherwise fall back to current recoveryCode
-														const codeToUse = verifiedRecoveryCode || recoveryCode;
-														if (!codeToUse || codeToUse.length !== 6) {
-															setError('Recovery code is required. Please verify your code again.');
-															setIsResettingPassword(false);
-															return;
-														}
-														console.log('[LoginScreen] Resetting password with recovery code:', codeToUse.substring(0, 2) + '****');
-														recoveryData = { code: codeToUse };
-													} else {
-														setError('Invalid recovery method');
+													const codeToUse = verifiedRecoveryCode || recoveryCode;
+													if (!codeToUse || codeToUse.length !== 6) {
+														setError('Recovery code is required. Please verify your code again.');
 														setIsResettingPassword(false);
 														return;
 													}
-													console.log('[LoginScreen] Calling resetMasterPasswordViaRecovery with method:', recoveryMethod);
+													const recoveryData = { code: codeToUse };
 													const result = await (window.vault as any).resetMasterPasswordViaRecovery(
 														newPassword,
-														recoveryMethod!,
+														'email_sms',
 														recoveryData
 													);
 													if (result.success) {
@@ -781,13 +484,11 @@ const LoginScreen: React.FC<Props> = ({ onLogin }) => {
 														setNewPassword('');
 														setConfirmNewPassword('');
 														setRecoveryMethod(null);
-														setBackupCode('');
 														setRecoveryCode('');
 														setVerifiedRecoveryCode(null);
 														setRecoveryEmail('');
 														setRecoveryPhone('');
 														setGeneratedCode(null);
-														setRecoveryAnswers([]);
 													}
 												} catch (error) {
 													const errorMsg = error instanceof Error ? error.message : 'Password reset failed';

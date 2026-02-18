@@ -4,7 +4,10 @@ export type Entry = {
 	username?: string;
 	password: string;
 	category: string;
+	url?: string;
+	notes?: string;
 	created_at?: string;
+	last_modified?: string;
 };
 
 export type EntryHistory = {
@@ -14,6 +17,7 @@ export type EntryHistory = {
 	username?: string;
 	password: string;
 	category: string;
+	url?: string;
 	change_type: string;
 	created_at: string;
 };
@@ -48,6 +52,8 @@ declare global {
 				username: string;
 				password: string;
 				category: string;
+				url?: string;
+				notes?: string;
 				masterPassword: string;
 			}) => Promise<void>;
 			getEntries: (masterPassword: string) => Promise<Entry[]>;
@@ -58,6 +64,8 @@ declare global {
 				username: string;
 				password: string;
 				category: string;
+				url?: string;
+				notes?: string;
 				masterPassword: string;
 			}) => Promise<boolean>;
 			deleteEntry: (id: number) => Promise<boolean>;
@@ -72,23 +80,28 @@ declare global {
 						skippedEntries?: Array<{ id: number; name: string; reason?: string }>;
 				  }
 			>;
-			setPasswordHint: (hint: string, masterPassword: string) => Promise<boolean>;
-			getPasswordHint: (masterPassword: string) => Promise<{ hint: string | null; error?: string } | null>;
-			setRecoveryQuestions: (questions: Array<{ question: string; answer: string }>, masterPassword: string) => Promise<boolean>;
-			verifyRecoveryQuestions: (answers: string[]) => Promise<{ verified: boolean; error?: string }>;
-			getRecoveryQuestions: () => Promise<Array<{ number: number; question: string }>>;
-		generateBackupCodes: (masterPassword: string) => Promise<string[]>;
-		verifyBackupCode: (code: string) => Promise<{ verified: boolean; error?: string }>;
-		getBackupCodesStatus: () => Promise<{ total: number; unused: number; used: number }>;
-		setupEmailSMSRecovery: (email: string, phone: string, masterPassword: string) => Promise<boolean>;
-		generateRecoveryCode: (email: string, phone: string) => Promise<{ success: boolean; code?: string }>;
-		verifyRecoveryCode: (code: string) => Promise<{ verified: boolean; error?: string }>;
-		resetMasterPasswordViaRecovery: (newPassword: string, recoveryMethod: 'questions' | 'backup_code' | 'email_sms', recoveryData: any) => Promise<{ success: boolean; message?: string; warning?: string }>;
+			hasAppAccount: () => Promise<boolean>;
+			createAppAccount: (username: string, password: string) => Promise<void>;
+			verifyAppLogin: (username: string, password: string) => Promise<boolean>;
+			isMasterPasswordSet: () => Promise<boolean>;
+			setupEmailSMSRecovery: (email: string, phone: string, masterPassword: string) => Promise<boolean>;
+			generateRecoveryCode: (email: string, phone: string) => Promise<{ success: boolean; code?: string }>;
+			verifyRecoveryCode: (code: string) => Promise<{ verified: boolean; error?: string }>;
+			resetMasterPasswordViaRecovery: (
+				newPassword: string,
+				recoveryMethod: 'email_sms',
+				recoveryData: any,
+			) => Promise<{ success: boolean; message?: string; warning?: string }>;
 			diagnoseEntry: (entryId: number, masterPassword: string) => Promise<any>;
 			testMasterPassword: (password: string) => Promise<boolean>;
 			getSecurityInfo: () => Promise<SecurityInfo>;
 			reportActivity: () => void;
 			onAutoLock: (callback: () => void) => void;
+			exportBackup: () => Promise<{ success: boolean; path?: string; canceled?: boolean }>;
+			restoreBackup: () => Promise<{ success: boolean; restarting?: boolean; canceled?: boolean }>;
+		};
+		app?: {
+			openExternal: (url: string) => Promise<void>;
 		};
 	}
 }

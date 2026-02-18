@@ -12,7 +12,6 @@
 
 # Project documentation (internal use only)
 PROJECT_SUMMARY.md
-SECURITY_FEATURES.md
 
 # Environment variables and secrets
 .env
@@ -121,6 +120,14 @@ coverage/
 test-results/
 playwright-report/
 playwright/.cache/
+
+# ============================================
+# Backup and junk files
+# ============================================
+*_original*
+*_backup*
+*.orig
+*.copy
 
 # ============================================
 # Miscellaneous
